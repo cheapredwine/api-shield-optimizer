@@ -1,0 +1,18 @@
+import type { DataConnector, ConnectorConfig, Endpoint } from '../types.js';
+import { CloudflareApiConnector } from './api.js';
+import { SnapshotConnector } from './snapshot.js';
+
+export function createConnector(config: ConnectorConfig): DataConnector {
+  switch (config.mode) {
+    case 'api':
+      return new CloudflareApiConnector();
+    case 'snapshot':
+      return new SnapshotConnector();
+    case 'mcp':
+      throw new Error('MCP connector not yet implemented. Use api or snapshot mode.');
+    default:
+      throw new Error(`Unknown connector mode: ${config.mode}`);
+  }
+}
+
+export { CloudflareApiConnector, SnapshotConnector };
