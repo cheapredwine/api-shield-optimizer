@@ -139,7 +139,7 @@ program
     } else {
       const fs = await import('node:fs/promises');
       const path = await import('node:path');
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const timestamp = new Date().toISOString().replace(/[-:T.Z]/g, '');
       await fs.mkdir('output', { recursive: true });
 
       const jsonPath = path.join('output', `ApiShieldProposed-${timestamp}.json`);

@@ -17,7 +17,7 @@ npm run build
 npx tsx src/cli.ts propose --mode snapshot --snapshot endpoints.json
 ```
 
-Writes `output/<timestamp>/ApiShieldProposed.json` and `ApiShieldProposed.txt`.
+Writes `output/ApiShieldProposed-{timestamp}.json` and `.txt`.
 
 ### API mode
 
