@@ -7,6 +7,7 @@ dist/
 
 # Generated outputs
 bundle.json
+bundle.txt
 
 # Local config with secrets
 optimizer.config.json

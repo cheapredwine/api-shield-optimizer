@@ -52,15 +52,24 @@ describe('normalizePath', () => {
 
 describe('normalizeHost', () => {
   it('returns single host unchanged', () => {
-    expect(normalizeHost(['api.example.com']).pattern).toBe('api.example.com');
+    const r = normalizeHost(['api.example.com']);
+    expect(r.pattern).toBe('api.example.com');
+    expect(r.canCollapse).toBe(true);
   });
   it('collapses single differing label', () => {
     const r = normalizeHost(['us-api.example.com', 'de-api.example.com', 'fr-api.example.com']);
     expect(r.pattern).toBe('{hostVar1}.example.com');
+    expect(r.canCollapse).toBe(true);
   });
   it('refuses multi-label differences', () => {
     const r = normalizeHost(['a.b.example.com', 'c.d.example.com']);
     expect(r.pattern).toBe('a.b.example.com');
+    expect(r.canCollapse).toBe(false);
+  });
+  it('refuses variable-depth subdomains', () => {
+    const r = normalizeHost(['api.example.com', 'foo.bar.example.com']);
+    expect(r.pattern).toBe('api.example.com');
+    expect(r.canCollapse).toBe(false);
   });
 });
 

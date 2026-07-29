@@ -81,6 +81,7 @@ export interface ConnectorConfig {
   accountId?: string;
   zoneId?: string;
   snapshotPath?: string;
+  state?: string;
 }
 
 export interface Zone {

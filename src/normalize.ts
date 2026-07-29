@@ -49,12 +49,20 @@ export function normalizePath(path: string): { pattern: string; varCount: number
   return { pattern, varCount, rules };
 }
 
-export function normalizeHost(hosts: string[]): { pattern: string; rules: string[] } {
-  if (hosts.length === 0) return { pattern: '', rules: [] };
-  if (hosts.length === 1) return { pattern: hosts[0], rules: [] };
+export function normalizeHost(hosts: string[]): { pattern: string; rules: string[]; canCollapse: boolean } {
+  if (hosts.length === 0) return { pattern: '', rules: [], canCollapse: false };
+  if (hosts.length === 1) return { pattern: hosts[0], rules: [], canCollapse: true };
 
   const split = hosts.map((h) => h.split('.'));
-  const minLen = Math.min(...split.map((s) => s.length));
+  const lengths = split.map((s) => s.length);
+  const minLen = Math.min(...lengths);
+  const maxLen = Math.max(...lengths);
+
+  // Require same depth for safe hostname variable collapse.
+  // Variable-depth subdomains cannot be covered by a single complete-label variable.
+  if (minLen !== maxLen) {
+    return { pattern: hosts[0], rules: [], canCollapse: false };
+  }
 
   // Find which label varies across hosts
   const differingLabels: number[] = [];
@@ -69,18 +77,19 @@ export function normalizeHost(hosts: string[]): { pattern: string; rules: string
   if (differingLabels.length === 1) {
     const idx = differingLabels[0];
     const template = split[0].map((label, i) => (i === idx ? '{hostVar1}' : label)).join('.');
-    return { pattern: template, rules: ['hostname-variable'] };
+    return { pattern: template, rules: ['hostname-variable'], canCollapse: true };
   }
 
   // If multiple labels differ, cannot safely use a single host variable
-  return { pattern: hosts[0], rules: [] };
+  return { pattern: hosts[0], rules: [], canCollapse: false };
 }
 
 export function groupEndpoints(endpoints: Endpoint[]): NormalizedGroup[] {
+  // First pass: group by method + raw host + normalized path
   const map = new Map<string, Endpoint[]>();
 
   for (const ep of endpoints) {
-    const { pattern: pathPattern, varCount: pathVars } = normalizePath(ep.path);
+    const { pattern: pathPattern } = normalizePath(ep.path);
     const key = `${ep.method}||${ep.host}||${pathPattern}`;
     const existing = map.get(key);
     if (existing) {
@@ -90,40 +99,49 @@ export function groupEndpoints(endpoints: Endpoint[]): NormalizedGroup[] {
     }
   }
 
-  // Second pass: try to merge groups that differ only by host when host can be variable-ized
-  const hostGroups = new Map<string, { hostPattern: string; pathPattern: string; method: string; members: Endpoint[] }>();
+  // Second pass: try to merge groups that differ only by host.
+  // Only merge when normalizeHost says the collapse is safe.
+  const mergedGroups: { hostPattern: string; pathPattern: string; method: string; members: Endpoint[] }[] = [];
 
   for (const [key, members] of map) {
     const [method, host, pathPattern] = key.split('||');
-    const pathKey = `${method}||${pathPattern}`;
-    const existing = hostGroups.get(pathKey);
-    if (existing) {
-      existing.members.push(...members);
-    } else {
-      hostGroups.set(pathKey, { hostPattern: host, pathPattern, method, members });
+
+    let found = false;
+    for (const group of mergedGroups) {
+      if (group.method === method && group.pathPattern === pathPattern) {
+        const combined = [...group.members, ...members];
+        const distinctHosts = [...new Set(combined.map((m) => m.host))];
+        const hostNorm = normalizeHost(distinctHosts);
+        if (hostNorm.canCollapse) {
+          group.members = combined;
+          group.hostPattern = hostNorm.pattern;
+          found = true;
+          break;
+        }
+      }
+    }
+
+    if (!found) {
+      mergedGroups.push({ hostPattern: host, pathPattern, method, members });
     }
   }
 
-  // Apply host normalization to groups with multiple distinct hosts
-  const groups: NormalizedGroup[] = [];
+  // Finalize groups
   let groupId = 1;
-
-  for (const { hostPattern, pathPattern, method, members } of hostGroups.values()) {
-    const distinctHosts = [...new Set(members.map((m) => m.host))];
+  return mergedGroups.map((g) => {
+    const distinctHosts = [...new Set(g.members.map((m) => m.host))];
     const hostNorm = normalizeHost(distinctHosts);
 
-    groups.push({
+    return {
       groupId: `group-${String(groupId++).padStart(4, '0')}`,
-      normalizedHostPattern: hostNorm.pattern || hostPattern,
-      normalizedPathPattern: pathPattern,
-      method,
-      members,
+      normalizedHostPattern: hostNorm.pattern || g.hostPattern,
+      normalizedPathPattern: g.pathPattern,
+      method: g.method,
+      members: g.members,
       recommendedAction: 'manual_review',
       confidence: 0.5,
       reasoning: [],
       flags: [],
-    });
-  }
-
-  return groups;
+    };
+  });
 }

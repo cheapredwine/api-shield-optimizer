@@ -3,6 +3,7 @@ import { Command } from 'commander';
 import { createInterface } from 'node:readline';
 import { ShieldOptimizerAgent } from './agent.js';
 import { CloudflareApiConnector } from './connectors/index.js';
+import { formatBundleAsText } from './format.js';
 import type { ConnectorConfig } from './types.js';
 
 interface ConfigFile {
@@ -14,6 +15,7 @@ interface ConfigFile {
   maxGroups?: number;
   output?: string;
   snapshot?: string;
+  state?: string;
 }
 
 async function loadConfig(path: string): Promise<ConfigFile> {
@@ -83,6 +85,7 @@ program
   .option('--account-id <id>', 'Cloudflare account ID')
   .option('--zone-id <id>', 'Cloudflare zone ID')
   .option('--snapshot <path>', 'Path to snapshot JSON file')
+  .option('--state <states>', 'Endpoint states to include (comma-separated)')
   .option('--min-hits <n>', 'Filter out endpoints below hit threshold')
   .option('--max-groups <n>', 'Limit number of groups in output')
   .option('--output <path>', 'Write proposal bundle to file instead of stdout')
@@ -111,6 +114,7 @@ program
       accountId: opts.accountId ?? fileConfig.accountId ?? undefined,
       zoneId,
       snapshotPath: opts.snapshot ?? fileConfig.snapshot ?? undefined,
+      state: opts.state ?? fileConfig.state ?? undefined,
     };
 
     const agent = new ShieldOptimizerAgent();
@@ -124,8 +128,14 @@ program
     const json = JSON.stringify(bundle, null, 2);
     if (outputPath) {
       const fs = await import('node:fs/promises');
+      const path = await import('node:path');
       await fs.writeFile(outputPath, json, 'utf-8');
       console.error(`Proposal bundle written to ${outputPath}`);
+
+      const textPath = outputPath.replace(/\.json$/i, '') + '.txt';
+      const text = formatBundleAsText(bundle);
+      await fs.writeFile(textPath, text, 'utf-8');
+      console.error(`Human-readable report written to ${textPath}`);
     } else {
       console.log(json);
     }
