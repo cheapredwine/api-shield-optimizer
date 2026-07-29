@@ -14,15 +14,19 @@ npm run build
 ### Snapshot mode (no API access needed)
 
 ```bash
-npx tsx src/cli.ts propose --mode snapshot --snapshot endpoints.json --output bundle.json
+npx tsx src/cli.ts propose --mode snapshot --snapshot endpoints.json
 ```
+
+Writes `output/<timestamp>/ApiShieldProposed.json` and `ApiShieldProposed.txt`.
 
 ### API mode
 
 ```bash
 export CF_API_TOKEN=<your-token>
-npx tsx src/cli.ts propose --mode api --zone-id <zone-id> --output bundle.json
+npx tsx src/cli.ts propose --mode api --zone-id <zone-id>
 ```
+
+Or use `--config` to load settings from a JSON file (see `optimizer.config.json.example`).
 
 ## CLI options
 
@@ -34,9 +38,10 @@ npx tsx src/cli.ts propose --mode api --zone-id <zone-id> --output bundle.json
 | `--zone-id` | Cloudflare zone ID |
 | `--account-id` | Cloudflare account ID |
 | `--snapshot` | Path to snapshot JSON file |
+| `--state` | Endpoint states to include: `review`, `saved`, `ignored` |
 | `--min-hits` | Filter endpoints below hit threshold |
 | `--max-groups` | Limit number of groups in output |
-| `--output` | Write bundle to file instead of stdout |
+| `--output` | Explicit output path (default: `output/<timestamp>/ApiShieldProposed.json`) |
 
 ## Library usage
 

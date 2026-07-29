@@ -6,6 +6,7 @@ dist/
 *.local
 
 # Generated outputs
+output/
 bundle.json
 bundle.txt
 

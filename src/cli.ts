@@ -137,7 +137,19 @@ program
       await fs.writeFile(textPath, text, 'utf-8');
       console.error(`Human-readable report written to ${textPath}`);
     } else {
-      console.log(json);
+      const fs = await import('node:fs/promises');
+      const path = await import('node:path');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      await fs.mkdir('output', { recursive: true });
+
+      const jsonPath = path.join('output', `ApiShieldProposed-${timestamp}.json`);
+      await fs.writeFile(jsonPath, json, 'utf-8');
+      console.error(`Proposal bundle written to ${jsonPath}`);
+
+      const textPath = path.join('output', `ApiShieldProposed-${timestamp}.txt`);
+      const text = formatBundleAsText(bundle);
+      await fs.writeFile(textPath, text, 'utf-8');
+      console.error(`Human-readable report written to ${textPath}`);
     }
   });
 
