@@ -43,8 +43,9 @@ export class ShieldOptimizerAgent {
 
   private filterEndpoints(endpoints: Endpoint[], options: AgentOptions): Endpoint[] {
     let out = endpoints;
-    if (options.minHits !== undefined && options.minHits > 0) {
-      out = out.filter((e) => e.hits >= options.minHits!);
+    const { minHits } = options;
+    if (minHits !== undefined && minHits > 0) {
+      out = out.filter((e) => e.hits >= minHits);
     }
     return out;
   }

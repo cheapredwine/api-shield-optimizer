@@ -9,6 +9,7 @@ import type { ConnectorConfig } from './types.js';
 interface ConfigFile {
   mode?: string;
   apiToken?: string;
+  tokenFile?: string;
   zoneId?: string;
   accountId?: string;
   minHits?: number;
@@ -28,7 +29,7 @@ const DEFAULT_CONFIG_PATH = 'optimizer.config.json';
 
 const DEFAULT_CONFIG: ConfigFile = {
   mode: 'api',
-  apiToken: '',
+  tokenFile: '',
   zoneId: '',
   accountId: '',
   minHits: 0,
@@ -127,11 +128,11 @@ program
     const mode = opts.mode ?? fileConfig.mode ?? 'snapshot';
     let apiToken = await resolveToken({
       apiToken: opts.apiToken || fileConfig.apiToken || undefined,
-      tokenFile: opts.tokenFile,
+      tokenFile: opts.tokenFile ?? fileConfig.tokenFile ?? undefined,
     });
 
     if (mode === 'api' && !apiToken) {
-      console.error('Error: API token required. Set CF_API_TOKEN, use --token-file, pass --api-token, or set apiToken in config.');
+      console.error('Error: API token required. Set CF_API_TOKEN, use --token-file, or pass --api-token.');
       process.exit(1);
     }
 
@@ -202,11 +203,11 @@ program
     }
     const apiToken = await resolveToken({
       apiToken: opts.apiToken || fileConfig.apiToken || undefined,
-      tokenFile: opts.tokenFile,
+      tokenFile: opts.tokenFile ?? fileConfig.tokenFile ?? undefined,
     });
 
     if (!apiToken) {
-      console.error('Error: API token required. Set CF_API_TOKEN, use --token-file, pass --api-token, or set apiToken in config.');
+      console.error('Error: API token required. Set CF_API_TOKEN, use --token-file, or pass --api-token.');
       process.exit(1);
     }
 
@@ -221,6 +222,53 @@ program
     } else {
       console.log(payload);
     }
+  });
+
+program
+  .command('smoke-fetch')
+  .description('Fetch API Shield operations and print pagination stats')
+  .option('--config <path>', 'Path to JSON config file')
+  .option('--api-token <token>', 'Cloudflare API token')
+  .option('--token-file <path>', 'Path to a file containing the API token')
+  .option('--zone-id <id>', 'Cloudflare zone ID')
+  .option('--account-id <id>', 'Cloudflare account ID')
+  .option('--state <states>', 'Endpoint states to include (comma-separated)')
+  .action(async (opts) => {
+    let fileConfig: ConfigFile;
+    if (opts.config) {
+      fileConfig = await loadConfig(opts.config);
+    } else {
+      const ensured = await ensureConfig();
+      fileConfig = ensured.config;
+    }
+
+    const apiToken = await resolveToken({
+      apiToken: opts.apiToken || fileConfig.apiToken || undefined,
+      tokenFile: opts.tokenFile ?? fileConfig.tokenFile ?? undefined,
+    });
+
+    if (!apiToken) {
+      console.error('Error: API token required. Set CF_API_TOKEN, use --token-file, or pass --api-token.');
+      process.exit(1);
+    }
+
+    let zoneId = opts.zoneId ?? fileConfig.zoneId ?? undefined;
+    if (!zoneId || zoneId === '') {
+      zoneId = await selectZoneInteractively(apiToken);
+    }
+
+    const connector = new CloudflareApiConnector();
+    const stats = await connector.fetchEndpointStats({
+      mode: 'api',
+      apiToken,
+      accountId: opts.accountId ?? fileConfig.accountId ?? undefined,
+      zoneId,
+      state: opts.state ?? fileConfig.state ?? undefined,
+    });
+
+    console.log(`Discovery operations: ${stats.discovery.operationCount} (pages fetched: ${stats.discovery.pagesFetched})`);
+    console.log(`Managed operations:   ${stats.managed.operationCount} (pages fetched: ${stats.managed.pagesFetched})`);
+    console.log(`Merged endpoints:     ${stats.merged.endpointCount}`);
   });
 
 program

@@ -7,6 +7,9 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/cli.ts",
+    "dev:worker": "wrangler dev",
+    "deploy:worker:check": "node scripts/deploy-worker-check.mjs",
+    "deploy:worker": "npm run deploy:worker:check && node scripts/deploy-worker.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",

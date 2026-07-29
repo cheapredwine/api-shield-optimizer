@@ -16,3 +16,4 @@ export function createConnector(config: ConnectorConfig): DataConnector {
 }
 
 export { CloudflareApiConnector, SnapshotConnector };
+export type { EndpointFetchStats } from './api.js';

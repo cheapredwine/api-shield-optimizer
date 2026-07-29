@@ -4,18 +4,63 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/i;
 const NUMERIC_RE = /^\d+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const DATE_SLASH_RE = /^\d{4}\/\d{2}\/\d{2}$/;
 const TIMESTAMP_RE = /^\d{10,13}$/;
 const HEX_RE = /^[0-9a-f]{16,}$/i;
 const BASE64_RE = /^[A-Za-z0-9+/]{20,}={0,2}$/;
-const TENANT_RE = /^[a-z0-9]{8,32}$/i;
+const MONGO_OBJECT_ID_RE = /^[0-9a-f]{24}$/i;
+const CUID_RE = /^c[a-z0-9]{24,}$/i;
+const CUID2_RE = /^[a-z][a-z0-9]{23,}$/i;
+const KSUID_RE = /^[0-9A-Za-z]{27}$/;
+const TENANT_RE = /^(?=.*[a-z])(?=.*\d)[a-z0-9]{12,32}$/i;
+
+const STATIC_SEGMENT_ALLOWLIST = new Set([
+  'account',
+  'accounts',
+  'admin',
+  'api',
+  'apps',
+  'billing',
+  'checkout',
+  'customer',
+  'customers',
+  'dashboard',
+  'health',
+  'invoices',
+  'login',
+  'orders',
+  'payments',
+  'products',
+  'profile',
+  'reports',
+  'settings',
+  'users',
+]);
+
+function isHighCardinalitySegment(segment: string): boolean {
+  if (segment.length <= 24) return false;
+  if (!/^[A-Za-z0-9_-]+$/.test(segment)) return false;
+
+  const hasLower = /[a-z]/.test(segment);
+  const hasUpper = /[A-Z]/.test(segment);
+  const hasDigit = /\d/.test(segment);
+  const hasSeparator = /[_-]/.test(segment);
+  const variety = [hasLower, hasUpper, hasDigit, hasSeparator].filter(Boolean).length;
+
+  return variety >= 2 && !/^[A-Za-z]+$/.test(segment);
+}
 
 export function isVariableSegment(segment: string): boolean {
+  const normalized = segment.toLowerCase();
+  if (STATIC_SEGMENT_ALLOWLIST.has(normalized)) return false;
+
   if (NUMERIC_RE.test(segment)) return true;
   if (UUID_RE.test(segment)) return true;
   if (ULID_RE.test(segment)) return true;
+  if (MONGO_OBJECT_ID_RE.test(segment)) return true;
+  if (CUID_RE.test(segment)) return true;
+  if (CUID2_RE.test(segment)) return true;
+  if (KSUID_RE.test(segment)) return true;
   if (DATE_RE.test(segment)) return true;
-  if (DATE_SLASH_RE.test(segment)) return true;
   if (TIMESTAMP_RE.test(segment)) return true;
   if (HEX_RE.test(segment)) return true;
   if (BASE64_RE.test(segment)) return true;
@@ -36,10 +81,11 @@ export function normalizePath(path: string): { pattern: string; varCount: number
       }
       return `{var${varCount}}`;
     }
-    // Treat any segment that looks like a file extension pattern as variable if long and random
-    if (seg.length > 24 && /[a-z0-9]{20,}/i.test(seg)) {
+    if (isHighCardinalitySegment(seg)) {
       varCount++;
-      rules.push('high-cardinality-segment');
+      if (!rules.includes('high-cardinality-segment')) {
+        rules.push('high-cardinality-segment');
+      }
       return `{var${varCount}}`;
     }
     return seg;
@@ -51,9 +97,11 @@ export function normalizePath(path: string): { pattern: string; varCount: number
 
 export function normalizeHost(hosts: string[]): { pattern: string; rules: string[]; canCollapse: boolean } {
   if (hosts.length === 0) return { pattern: '', rules: [], canCollapse: false };
-  if (hosts.length === 1) return { pattern: hosts[0], rules: [], canCollapse: true };
+  const normalizedHosts = hosts.map((host) => host.trim().toLowerCase()).filter((host) => host.length > 0);
+  if (normalizedHosts.length === 0) return { pattern: '', rules: [], canCollapse: false };
+  if (normalizedHosts.length === 1) return { pattern: normalizedHosts[0], rules: [], canCollapse: true };
 
-  const split = hosts.map((h) => h.split('.'));
+  const split = normalizedHosts.map((h) => h.split('.'));
   const lengths = split.map((s) => s.length);
   const minLen = Math.min(...lengths);
   const maxLen = Math.max(...lengths);
@@ -61,7 +109,7 @@ export function normalizeHost(hosts: string[]): { pattern: string; rules: string
   // Require same depth for safe hostname variable collapse.
   // Variable-depth subdomains cannot be covered by a single complete-label variable.
   if (minLen !== maxLen) {
-    return { pattern: hosts[0], rules: [], canCollapse: false };
+    return { pattern: normalizedHosts[0], rules: [], canCollapse: false };
   }
 
   // Find which label varies across hosts
@@ -81,7 +129,7 @@ export function normalizeHost(hosts: string[]): { pattern: string; rules: string
   }
 
   // If multiple labels differ, cannot safely use a single host variable
-  return { pattern: hosts[0], rules: [], canCollapse: false };
+  return { pattern: normalizedHosts[0], rules: [], canCollapse: false };
 }
 
 export function groupEndpoints(endpoints: Endpoint[]): NormalizedGroup[] {

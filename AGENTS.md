@@ -13,12 +13,12 @@ Preferred: run once to auto-create `optimizer.config.json` (already in `.gitigno
 npx tsx src/cli.ts propose
 ```
 
-The tool creates the config file and exits. Edit it to add your API token:
+The tool creates the config file and exits. Set `tokenFile` to a path outside repo:
 
 ```json
 {
   "mode": "api",
-  "apiToken": "your-token",
+  "tokenFile": "/absolute/path/to/cf_api_token",
   "zoneId": "",
   "accountId": ""
 }

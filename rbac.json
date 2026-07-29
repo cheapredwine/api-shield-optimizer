@@ -1,0 +1,11 @@
+{
+  "defaultDeny": true,
+  "users": {},
+  "groups": {
+    "api-shield-admins": {
+      "permissions": ["smoke", "propose"],
+      "zoneIds": ["*"],
+      "accountIds": ["*"]
+    }
+  }
+}

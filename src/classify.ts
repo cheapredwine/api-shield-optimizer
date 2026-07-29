@@ -22,19 +22,23 @@ const SAVE_PATH_PATTERNS = [
 ];
 
 const IGNORE_PATH_PATTERNS = [
-  /\/health/i,
-  /\/ping/i,
-  /\/ready/i,
-  /\/live/i,
-  /\/debug/i,
-  /\/test/i,
-  /\/fixture/i,
+  /(?:^|\/)health(?:\/|$)/i,
+  /(?:^|\/)ping(?:\/|$)/i,
+  /(?:^|\/)ready(?:\/|$)/i,
+  /(?:^|\/)live(?:\/|$)/i,
+  /(?:^|\/)debug(?:\/|$)/i,
+  /(?:^|\/)test(?:\/|$)/i,
+  /(?:^|\/)fixture(?:\/|$)/i,
   /\/internal\/probe/i,
   /\/_next\/static/i,
-  /\/assets\//i,
-  /\/favicon/i,
-  /\/robots\.txt/i,
-  /\/\.well-known/i,
+  /(?:^|\/)assets(?:\/|$)/i,
+  /(?:^|\/)favicon(?:\.ico)?(?:$|\?)/i,
+  /(?:^|\/)robots\.txt(?:$|\?)/i,
+  /(?:^|\/)\.well-known(?:\/|$)/i,
+  /(?:^|\/)sitemap\.xml(?:$|\?)/i,
+  /(?:^|\/)cdn-cgi(?:\/|$)/i,
+  /\.map(?:$|\?)/i,
+  /(?:^|\/)static(?:\/|$)/i,
 ];
 
 const SENSITIVE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
@@ -50,9 +54,24 @@ export function classifyGroup(group: NormalizedGroup): { action: Action; confide
   const distinctHosts = new Set(group.members.map((m) => m.host)).size;
   const hasVariableHost = group.normalizedHostPattern.includes('{hostVar');
   const hasVariablePath = group.normalizedPathPattern.includes('{var');
-  const methods = new Set(group.members.map((m) => m.method));
-  const mixedMethods = methods.size > 1;
-  const sensitiveMethod = [...methods].some((m) => SENSITIVE_METHODS.has(m));
+  const method = group.method.toUpperCase();
+  const sensitiveMethod = SENSITIVE_METHODS.has(method);
+  const hasGraphql = /(?:^|\/)graphql(?:\/|$)/i.test(group.normalizedPathPattern);
+  const hasApiVersion = /\/v\d+(?:\/|$)/i.test(group.normalizedPathPattern);
+  const hasContractPath = /(?:^|\/)(openapi|swagger)(?:\/|$|\.)/i.test(group.normalizedPathPattern);
+  const hasStaleObservation = group.members.every((m) => {
+    const ts = Date.parse(m.lastSeenAt);
+    if (Number.isNaN(ts)) return false;
+    const ageDays = (Date.now() - ts) / (1000 * 60 * 60 * 24);
+    return ageDays > 90;
+  });
+  const hasFreshObservation = group.members.some((m) => {
+    const ts = Date.parse(m.lastSeenAt);
+    if (Number.isNaN(ts)) return false;
+    const ageDays = (Date.now() - ts) / (1000 * 60 * 60 * 24);
+    return ageDays <= 14;
+  });
+  const hasManualSource = group.members.some((m) => m.source === 'manual');
 
   // Scoring
   let score = 0.5;
@@ -84,10 +103,31 @@ export function classifyGroup(group: NormalizedGroup): { action: Action; confide
     reasoning.push('sensitive HTTP method observed');
   }
 
-  if (mixedMethods) {
-    score -= 0.1;
-    reasoning.push('mixed HTTP methods on same path shape');
-    flags.push('method-ambiguity');
+  if (method === 'OPTIONS') {
+    score -= 0.5;
+    reasoning.push('CORS preflight method is usually low-value for protection policies');
+    flags.push('likely-noise');
+  }
+
+  if (hasGraphql || hasApiVersion || hasContractPath) {
+    score += 0.08;
+    reasoning.push('API contract-oriented path detected (version/graphql/openapi/swagger)');
+  }
+
+  if (hasManualSource) {
+    score += 0.08;
+    reasoning.push('contains manually managed operations');
+  }
+
+  if (hasFreshObservation && totalHits > 1000) {
+    score += 0.05;
+    reasoning.push('recently active endpoint shape with meaningful traffic');
+  }
+
+  if (hasStaleObservation && totalHits < 100) {
+    score -= 0.08;
+    reasoning.push('stale endpoint shape with low observed traffic');
+    flags.push('stale-observation');
   }
 
   if (hasVariableHost && distinctHosts > 1) {
@@ -111,6 +151,8 @@ export function classifyGroup(group: NormalizedGroup): { action: Action; confide
     score -= 0.2;
     reasoning.push('some members already ignored');
   }
+
+  score = Math.max(0, Math.min(1, score));
 
   // Decision boundary
   let action: Action;

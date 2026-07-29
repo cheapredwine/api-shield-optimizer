@@ -28,8 +28,14 @@ describe('isVariableSegment', () => {
   it('detects dates', () => {
     expect(isVariableSegment('2026-07-28')).toBe(true);
   });
+  it('detects Mongo ObjectId', () => {
+    expect(isVariableSegment('507f1f77bcf86cd799439011')).toBe(true);
+  });
   it('rejects plain words', () => {
     expect(isVariableSegment('users')).toBe(false);
+  });
+  it('rejects allowlisted static nouns', () => {
+    expect(isVariableSegment('customers')).toBe(false);
   });
 });
 
@@ -47,6 +53,11 @@ describe('normalizePath', () => {
     const r = normalizePath('/health');
     expect(r.pattern).toBe('/health');
     expect(r.varCount).toBe(0);
+  });
+  it('collapses high-cardinality random-like segment', () => {
+    const r = normalizePath('/files/eJ4xD5L_92QaA11dwM7A9-bNxQ1wYhK2');
+    expect(r.pattern).toBe('/files/{var1}');
+    expect(r.rules).toContain('high-cardinality-segment');
   });
 });
 
@@ -127,6 +138,56 @@ describe('classifyGroup', () => {
     };
     const c = classifyGroup(group);
     expect(c.action).toBe('ignore');
+  });
+
+  it('does not treat /testimonials as test noise', () => {
+    const group: NormalizedGroup = {
+      groupId: 'g3',
+      normalizedHostPattern: 'api.example.com',
+      normalizedPathPattern: '/testimonials',
+      method: 'GET',
+      members: [makeEp({ path: '/testimonials', hits: 200, host: 'api.example.com' })],
+      recommendedAction: 'manual_review',
+      confidence: 0.5,
+      reasoning: [],
+      flags: [],
+    };
+    const c = classifyGroup(group);
+    expect(c.action).toBe('manual_review');
+  });
+
+  it('downranks OPTIONS preflight operations', () => {
+    const group: NormalizedGroup = {
+      groupId: 'g4',
+      normalizedHostPattern: 'api.example.com',
+      normalizedPathPattern: '/v1/users',
+      method: 'OPTIONS',
+      members: [makeEp({ path: '/v1/users', method: 'OPTIONS', hits: 50, host: 'api.example.com' })],
+      recommendedAction: 'manual_review',
+      confidence: 0.5,
+      reasoning: [],
+      flags: [],
+    };
+    const c = classifyGroup(group);
+    expect(c.action).toBe('manual_review');
+    expect(c.flags).toContain('likely-noise');
+  });
+
+  it('downranks stale low-traffic endpoints', () => {
+    const stale = new Date(Date.now() - 1000 * 60 * 60 * 24 * 120).toISOString();
+    const group: NormalizedGroup = {
+      groupId: 'g5',
+      normalizedHostPattern: 'api.example.com',
+      normalizedPathPattern: '/v1/legacy',
+      method: 'GET',
+      members: [makeEp({ path: '/v1/legacy', method: 'GET', hits: 5, host: 'api.example.com', lastSeenAt: stale })],
+      recommendedAction: 'manual_review',
+      confidence: 0.5,
+      reasoning: [],
+      flags: [],
+    };
+    const c = classifyGroup(group);
+    expect(c.flags).toContain('stale-observation');
   });
 });
 
