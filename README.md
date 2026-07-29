@@ -73,6 +73,38 @@ npx tsx src/cli.ts propose --mode snapshot --snapshot endpoints.json
 | `--max-groups` | Limit number of groups in output |
 | `--output` | Explicit output path (default: `output/ApiShieldProposed-{timestamp}.json`) |
 
+## Normalized groups
+
+A **normalized group** is a cluster of discovered endpoints that share the same canonical shape after the optimizer collapses variable segments and similar hostnames. The grouping process works in two stages:
+
+### Path normalization
+
+Variable path segments are replaced with `{var1}`, `{var2}`, etc. when they look like:
+
+- Numeric IDs (`/users/123` → `/users/{var1}`)
+- UUIDs (`/orders/ab12cd34-...` → `/orders/{var1}`)
+- Dates and timestamps
+- Hex or Base64 tokens
+- High-cardinality random strings
+
+### Host normalization
+
+When multiple subdomains share the same path shape, the hostname is collapsed into a variable pattern:
+
+```
+us-api.example.com/users/{var1}
+de-api.example.com/users/{var1}
+fr-api.example.com/users/{var1}
+```
+
+→ `{hostVar1}.example.com/users/{var1}`
+
+**Safety constraint:** hostnames are only collapsed when all members have the **same label depth** and exactly **one label differs**. Variable-depth subdomains are never merged (e.g. `api.example.com` and `foo.bar.example.com` stay separate).
+
+### Why groups matter
+
+Each group becomes one proposal. Instead of reviewing hundreds of raw endpoints individually, you review a handful of canonical shapes. Every proposal lists the specific member endpoints that were grouped together, the confidence score, and the reasoning.
+
 ## Library usage
 
 ```ts
