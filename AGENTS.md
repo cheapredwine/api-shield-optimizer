@@ -5,6 +5,27 @@
 - `npm run dev` — runs CLI via `tsx`
 - `npm test` — runs Vitest
 
+## Running the tool
+
+Preferred: create `optimizer.config.json` (already in `.gitignore`):
+
+```json
+{
+  "mode": "api",
+  "apiToken": "your-token",
+  "zoneId": "",
+  "accountId": ""
+}
+```
+
+Leave `zoneId` blank for interactive zone picker. Then:
+
+```bash
+npx tsx src/cli.ts propose --config optimizer.config.json
+```
+
+Output: `output/ApiShieldProposed-{timestamp}.json` and `.txt`
+
 ## Code style
 - Strict TypeScript (`strict: true`)
 - Use `.js` extensions in imports (NodeNext module resolution)

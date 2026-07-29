@@ -11,29 +11,55 @@ npm install
 npm run build
 ```
 
+### Config file (recommended)
+
+Create `optimizer.config.json` in the project root:
+
+```json
+{
+  "mode": "api",
+  "apiToken": "your-cloudflare-api-token",
+  "zoneId": "",
+  "accountId": "",
+  "minHits": 0,
+  "maxGroups": 0
+}
+```
+
+Leave `zoneId` blank to get an interactive zone picker. Then run:
+
+```bash
+npx tsx src/cli.ts propose --config optimizer.config.json
+```
+
+Writes `output/ApiShieldProposed-{timestamp}.json` and `.txt`.
+
+### Config file fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `mode` | Yes | `api` or `snapshot` |
+| `apiToken` | For API mode | Cloudflare API token (keep this file secret) |
+| `zoneId` | For API mode | Cloudflare zone ID. Leave blank for interactive picker |
+| `accountId` | No | Cloudflare account ID |
+| `snapshot` | For snapshot mode | Path to snapshot JSON file |
+| `state` | No | Comma-separated states: `review`, `saved`, `ignored` |
+| `minHits` | No | Filter endpoints below hit threshold (default: 0) |
+| `maxGroups` | No | Limit number of groups in output (default: 0 = no limit) |
+
 ### Snapshot mode (no API access needed)
 
 ```bash
 npx tsx src/cli.ts propose --mode snapshot --snapshot endpoints.json
 ```
 
-Writes `output/ApiShieldProposed-{timestamp}.json` and `.txt`.
-
-### API mode
-
-```bash
-export CF_API_TOKEN=<your-token>
-npx tsx src/cli.ts propose --mode api --zone-id <zone-id>
-```
-
-Or use `--config` to load settings from a JSON file (see `optimizer.config.json.example`).
-
-## CLI options
+### CLI options (use config file instead when possible)
 
 | Option | Description |
 |--------|-------------|
+| `--config` | Path to JSON config file |
 | `--mode` | `api` or `snapshot` |
-| `--api-token` | Cloudflare API token ( discouraged — use env var or token file ) |
+| `--api-token` | Cloudflare API token ( discouraged — use config or env var ) |
 | `--token-file` | Path to file containing API token |
 | `--zone-id` | Cloudflare zone ID |
 | `--account-id` | Cloudflare account ID |
@@ -41,7 +67,7 @@ Or use `--config` to load settings from a JSON file (see `optimizer.config.json.
 | `--state` | Endpoint states to include: `review`, `saved`, `ignored` |
 | `--min-hits` | Filter endpoints below hit threshold |
 | `--max-groups` | Limit number of groups in output |
-| `--output` | Explicit output path (default: `output/<timestamp>/ApiShieldProposed.json`) |
+| `--output` | Explicit output path (default: `output/ApiShieldProposed-{timestamp}.json`) |
 
 ## Library usage
 
@@ -150,9 +176,10 @@ When a signal fires, a flag is attached to the proposal:
 
 ## Security notes
 
-- Prefer `CF_API_TOKEN` environment variable over `--api-token` flag.
-- `--api-token` leaks into shell history and process lists.
-- Use `--token-file` with `chmod 600` if env vars are not an option.
+- **Config file** — Keep `optimizer.config.json` out of version control (it's already in `.gitignore`). This is the preferred place for the API token.
+- **Environment variable** — `CF_API_TOKEN` is the second-best option. No file on disk.
+- **Never use `--api-token`** — It leaks into shell history and process lists.
+- **Token file** — Use `--token-file` with `chmod 600` if neither config nor env vars work.
 
 ## Tests
 
