@@ -7,7 +7,13 @@
 
 ## Running the tool
 
-Preferred: create `optimizer.config.json` (already in `.gitignore`):
+Preferred: run once to auto-create `optimizer.config.json` (already in `.gitignore`):
+
+```bash
+npx tsx src/cli.ts propose
+```
+
+The tool creates the config file and exits. Edit it to add your API token:
 
 ```json
 {
@@ -18,11 +24,7 @@ Preferred: create `optimizer.config.json` (already in `.gitignore`):
 }
 ```
 
-Leave `zoneId` blank for interactive zone picker. Then:
-
-```bash
-npx tsx src/cli.ts propose --config optimizer.config.json
-```
+Leave `zoneId` blank for interactive zone picker. Re-run the same command.
 
 Output: `output/ApiShieldProposed-{timestamp}.json` and `.txt`
 

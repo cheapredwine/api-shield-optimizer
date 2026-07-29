@@ -24,6 +24,32 @@ async function loadConfig(path: string): Promise<ConfigFile> {
   return JSON.parse(raw) as ConfigFile;
 }
 
+const DEFAULT_CONFIG_PATH = 'optimizer.config.json';
+
+const DEFAULT_CONFIG: ConfigFile = {
+  mode: 'api',
+  apiToken: '',
+  zoneId: '',
+  accountId: '',
+  minHits: 0,
+  maxGroups: 0,
+};
+
+async function ensureConfig(): Promise<{ path: string; config: ConfigFile }> {
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+
+  try {
+    await fs.access(DEFAULT_CONFIG_PATH);
+    return { path: DEFAULT_CONFIG_PATH, config: await loadConfig(DEFAULT_CONFIG_PATH) };
+  } catch {
+    const json = JSON.stringify(DEFAULT_CONFIG, null, 2) + '\n';
+    await fs.writeFile(DEFAULT_CONFIG_PATH, json, 'utf-8');
+    console.error(`Created ${DEFAULT_CONFIG_PATH}. Please edit it to add your API token, then re-run.`);
+    process.exit(1);
+  }
+}
+
 async function resolveToken(opts: {
   apiToken?: string;
   tokenFile?: string;
@@ -90,7 +116,13 @@ program
   .option('--max-groups <n>', 'Limit number of groups in output')
   .option('--output <path>', 'Write proposal bundle to file instead of stdout')
   .action(async (opts) => {
-    const fileConfig: ConfigFile = opts.config ? await loadConfig(opts.config) : {};
+    let fileConfig: ConfigFile;
+    if (opts.config) {
+      fileConfig = await loadConfig(opts.config);
+    } else {
+      const ensured = await ensureConfig();
+      fileConfig = ensured.config;
+    }
 
     const mode = opts.mode ?? fileConfig.mode ?? 'snapshot';
     let apiToken = await resolveToken({
@@ -161,7 +193,13 @@ program
   .option('--token-file <path>', 'Path to a file containing the API token')
   .option('--output <path>', 'Write JSON to file instead of stdout')
   .action(async (opts) => {
-    const fileConfig: ConfigFile = opts.config ? await loadConfig(opts.config) : {};
+    let fileConfig: ConfigFile;
+    if (opts.config) {
+      fileConfig = await loadConfig(opts.config);
+    } else {
+      const ensured = await ensureConfig();
+      fileConfig = ensured.config;
+    }
     const apiToken = await resolveToken({
       apiToken: opts.apiToken || fileConfig.apiToken || undefined,
       tokenFile: opts.tokenFile,

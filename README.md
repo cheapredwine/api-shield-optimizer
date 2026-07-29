@@ -13,12 +13,18 @@ npm run build
 
 ### Config file (recommended)
 
-Create `optimizer.config.json` in the project root:
+On first run, the tool automatically creates `optimizer.config.json` if it doesn't exist. Then just add your API token and run:
+
+```bash
+npx tsx src/cli.ts propose
+```
+
+The generated file looks like this:
 
 ```json
 {
   "mode": "api",
-  "apiToken": "your-cloudflare-api-token",
+  "apiToken": "",
   "zoneId": "",
   "accountId": "",
   "minHits": 0,
@@ -26,11 +32,9 @@ Create `optimizer.config.json` in the project root:
 }
 ```
 
-Leave `zoneId` blank to get an interactive zone picker. Then run:
-
-```bash
-npx tsx src/cli.ts propose --config optimizer.config.json
-```
+- Add your `apiToken`
+- Leave `zoneId` blank for an interactive zone picker
+- Re-run the same command
 
 Writes `output/ApiShieldProposed-{timestamp}.json` and `.txt`.
 
