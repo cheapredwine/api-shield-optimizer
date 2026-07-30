@@ -188,6 +188,13 @@ export interface ConnectorConfig {
   state?: string;
   /** Enrich endpoints with uploaded schema membership. Defaults to true. */
   useSchemas?: boolean;
+  /**
+   * Reports conditions the operator must know about but which are not fatal:
+   * discarded malformed records, and a zone larger than the pagination cap. Both
+   * mean the analysis ran on less than the full surface, which is exactly when a
+   * missing endpoint matters most, so neither may be swallowed.
+   */
+  onWarning?: (message: string) => void;
 }
 
 export interface Zone {

@@ -26,35 +26,24 @@ to revisit first.
 
 ## Known bugs, unfixed
 
-- **Sibling propagation over-merges.** Stage 2 of `inferSiblingVariables` drops
-  the identical-continuation requirement and matches on prefix+position alone, so
-  `/products/clearance` and `/products/gift-guide` are absorbed into
-  `/products/{var1}`. Three operations become one; two vanish and their traffic
-  is misattributed. Only `STATIC_SEGMENT_ALLOWLIST` guards it. Fix: require the
-  continuation to match, or require the absorbed literal to resemble its
-  siblings. This is the "worst failure direction" this file warns about.
-- **`connectors/api.ts` `mergeEndpoints` coerces unknown traffic to zero** —
-  `hits: (existing.hits ?? 0) + (ep.hits ?? 0)`. In API mode `hits` is always
-  null, so every deduplicated shape becomes `0`, which then reads as measured.
-  Must yield `null` when both are null.
-- `rankValue` can rank `manual_review` above `save`: the traffic term spans
-  ~1.125 but the action term only 1.0.
-- Budget is computed *after* `maxGroups` truncation, so the report claims free
-  slots that do not exist.
-- `minHits` is a silent no-op in API mode — it inspects only `hits`. Use
-  `requestsPerHour()`.
-- `methodsByShape` is keyed by path only despite a comment saying host+path, so
-  `rest-method-set` is awarded across unrelated hosts.
-- Malformed API records are defaulted into plausible operations
-  (`{host:"",method:"GET",path:"/"}`) and can reach the export payload.
-- `scoring` overrides from the config file are unvalidated: `apiFloor: -1` turns
-  a privacy policy into a `save`. `rulesetVersion` is user-overridable.
-- `buildApplyPayload` and `formatBundleAsText` have no tests at all, and nothing
-  asserts the GET-only invariant.
+- **Sibling inference can still merge a static family.** `segmentShape` gates
+  absorption on the literal resembling its siblings, which is what keeps
+  `/products/clearance` out of `/products/{var1}`. But four or more static pages
+  of the same shape under one prefix — `clearance`, `gift-guide`, `new-arrivals`,
+  `sale` — are indistinguishable from `/c/{category}` by shape alone and will
+  collapse. `STATIC_SEGMENT_ALLOWLIST` is the only guard. This is the residual
+  form of the worst failure direction: err toward literal, since a missing
+  allowlist entry merges operations while a spurious one only splits a group.
 
 **Hard rule: this tool must never write to the Cloudflare API.** Connectors issue
 `GET` only. `src/export.ts` builds request payloads as data and performs no
 network I/O. Do not add a command that applies changes.
+
+The `read-only invariant` describe in `connectors.test.ts` asserts this by
+recording the method of every request across `fetchEndpoints`,
+`fetchEndpointStats` and `listZones`. CI greps the connector sources for a write
+verb as a second line of defence. Neither is decoration: verify any change to
+them still fails when a `method: 'POST'` is introduced.
 
 ## Build
 - `npm run build` — compiles TypeScript to `dist/`
@@ -221,11 +210,17 @@ Edit `src/normalize.ts`:
 - Prefer `inferSiblingVariables()` over a new regex. Per-segment rules judge each
   literal in isolation, so members of one identifier family land on opposite
   sides of a threshold and a single logical operation is reported as a `{varN}`
-  group **plus** a tail of literal groups. Sibling inference never inspects the
-  literal: a position is variable when enough distinct values share a prefix,
-  depth and identical continuation. That is also the only thing that can catch
-  word-based ids (`/c/{category}`, `/p/{slug}`), which are indistinguishable
-  from static resource names in isolation.
+  group **plus** a tail of literal groups. Sibling inference instead requires
+  enough distinct values sharing a prefix, depth, continuation **and coarse
+  shape**. That is also the only thing that can catch word-based ids
+  (`/c/{category}`, `/p/{slug}`), which are indistinguishable from static
+  resource names in isolation.
+- `segmentShape()` is what stops a static page being absorbed by an identifier
+  family it merely sits beside: `/products/clearance` shares the prefix, depth
+  and continuation of `/products/8813245`, so only the shape of the value
+  separates them. Keep its classes **coarse** — `electronics` and `home-garden`
+  must land in the same class or `/c/{category}` splits — and keep them
+  **length-independent**, since `/orders/7` and `/orders/183024` belong together.
 - Already-variable siblings **count as evidence**, and a confirmed position
   propagates to deeper continuations (`/x/{id}` ⇒ `/x/{id}/sub`). Without the
   first, an id family stays split exactly when half of it has been recognised;
@@ -296,10 +291,17 @@ Consequences worth remembering:
   order, so `--operation-budget 2` can pick 5 req/hr over 900 req/hr.
 - `hasTrafficData` must consider the rate, or every live endpoint is flagged
   `no-traffic-data` and reports read `Total Hits: 0`.
-- `highTrafficRatePerHour` / `lowTrafficRatePerHour` are **absolute** thresholds
-  (1000 and 1). On a zone doing billions of requests a day every endpoint clears
-  the high mark and none falls below the low one, so both signals saturate and
-  stop discriminating. Percentile-relative thresholds are the known fix.
+- Traffic thresholds are **relative to the zone**. `computeTrafficThresholds()`
+  in `src/classify.ts` takes the `highTrafficPercentile` (0.9) and
+  `lowTrafficPercentile` (0.25) of the rates the zone actually reports, and
+  `agent.run()` computes it once and passes it to every `classifyGroup()` call.
+  `highTrafficRatePerHour` / `lowTrafficRatePerHour` (1000 and 1) remain the
+  fallback, used when fewer than `trafficPercentileMinSamples` (20) endpoints
+  report a rate or when the distribution is flat — a percentile over a handful of
+  samples describes the sample, not the zone. Absolute marks alone saturate: on a
+  zone doing billions of requests a day every endpoint clears the high mark and
+  none falls below the low one, so both signals stop discriminating at exactly
+  the scale where prioritisation matters.
 
 ## Output
 - Default: `output/ApiShieldProposed-{timestamp}.json`, `.txt` and `.csv`
@@ -336,17 +338,17 @@ riskiest knobs: propagation can over-merge a genuine sub-resource that is missin
 from `STATIC_SEGMENT_ALLOWLIST`. A sanitized path list from a zone with thousands
 of overlapping operations would settle it.
 
-### Percentile-relative traffic thresholds
-`highTrafficRatePerHour` / `lowTrafficRatePerHour` are absolute, so on a very
-large zone every endpoint clears the high threshold and the signal stops
-discriminating. Replace with per-zone percentiles, and keep the absolute values as
-a fallback for zones too small for percentiles to mean anything.
+### Percentile thresholds are untuned against a real distribution
+`highTrafficPercentile` (0.9) and `lowTrafficPercentile` (0.25) are guesses. On a
+zone with a long tail of near-idle operations the low percentile may land inside
+the noise and flag `low-traffic` on endpoints that matter. Measure the rate
+distribution of a real zone before adjusting.
 
-### Surface truncation
-`fetchPaginated` computes a `truncated` flag and then discards it. `MAX_PAGES`
-(200) × `PER_PAGE` (100) caps a zone at 20,000 operations. A zone past that limit
-is silently analysed on partial data, which is exactly the situation where a
-missing endpoint matters most. Thread it into `EndpointFetchStats` and print it.
+### The page cap is reported, not raised
+`MAX_PAGES` (200) × `PER_PAGE` (100) caps a zone at 20,000 operations per
+collection. `warnIfTruncated()` surfaces it through `ConnectorConfig.onWarning`
+and `EndpointFetchStats.truncated`, so the operator is told, but the analysis is
+still run on partial data. A zone that large needs a narrower scope.
 
 ### No-label fallback has almost no headroom
 An operation with no managed labels sits at `baseApiScore` 0.35 against an

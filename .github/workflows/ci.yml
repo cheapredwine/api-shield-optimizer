@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 18 is the floor declared in `engines`; global fetch is unavailable below it.
+        node: ['18', '20', '22']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Type check
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # The tool must never write to a customer zone. The read-only invariant is
+      # asserted in the test suite; this catches a write verb reaching the
+      # connector source by any other route.
+      - name: Assert connector issues no write verbs
+        run: |
+          if grep -nE "method:\s*['\"](POST|PUT|PATCH|DELETE)['\"]" src/connectors/*.ts; then
+            echo "::error::A write method appears in a connector. Connectors are GET-only."
+            exit 1
+          fi

@@ -8,7 +8,14 @@ import type {
 } from './types.js';
 import { CloudflareApiConnector } from './connectors/index.js';
 import { groupEndpoints } from './normalize.js';
-import { applySiblingPropagation, classifyGroup, totalKnownHits, totalRequestsPerHour } from './classify.js';
+import {
+  applySiblingPropagation,
+  classifyGroup,
+  computeTrafficThresholds,
+  requestsPerHour,
+  totalKnownHits,
+  totalRequestsPerHour,
+} from './classify.js';
 import { generateBundle, type BundleContext } from './proposal.js';
 import { resolveScoringConfig, type CompiledScoringConfig, type ScoringConfig } from './scoring-config.js';
 
@@ -57,8 +64,13 @@ export class ShieldOptimizerAgent {
     const filtered = this.filterEndpoints(candidates, options);
 
     let groups = groupEndpoints(filtered);
+
+    // Derived once from the whole zone: a traffic threshold relative to this
+    // zone's own distribution keeps discriminating at any request volume.
+    const traffic = computeTrafficThresholds(groups, config);
+
     groups = groups.map((group) => {
-      const classification = classifyGroup(group, config);
+      const classification = classifyGroup(group, config, traffic);
       return {
         ...group,
         recommendedAction: classification.action,
@@ -77,6 +89,7 @@ export class ShieldOptimizerAgent {
     // Rank by value so that a `maxGroups` or budget cut keeps the best entries.
     groups.sort((a, b) => rankValue(b) - rankValue(a));
 
+    const analyzedGroups = groups;
     const analyzedGroupCount = groups.length;
     const analyzedEndpointCount = groups.reduce((sum, g) => sum + g.members.length, 0);
 
@@ -84,7 +97,17 @@ export class ShieldOptimizerAgent {
       groups = groups.slice(0, options.maxGroups);
     }
 
-    const budget = this.buildBudget(groups, alreadySaved, options, config);
+    // Budget is computed from every analysed group, not from the truncated
+    // report. `maxGroups` limits what is printed, not what the zone contains, so
+    // counting after truncation understates the saves and claims slots that are
+    // not free.
+    const budget = this.buildBudget(
+      analyzedGroups,
+      alreadySaved,
+      options,
+      config,
+      analyzedGroups.length - groups.length,
+    );
 
     const context: BundleContext = {
       zoneId: options.connectorConfig.zoneId,
@@ -108,9 +131,12 @@ export class ShieldOptimizerAgent {
     const { minHits } = options;
     if (minHits === undefined || !Number.isFinite(minHits) || minHits <= 0) return endpoints;
 
-    // Endpoints without traffic data are retained: `null` means unknown, not
-    // zero. Dropping them silently removed every managed operation.
-    return endpoints.filter((e) => e.hits === null || e.hits === undefined || e.hits >= minHits);
+    return endpoints.filter((e) => {
+      const level = observedTrafficLevel(e);
+      // Endpoints without traffic data are retained: `null` means unknown, not
+      // zero. Dropping them removes every managed operation.
+      return level === null || level >= minHits;
+    });
   }
 
   /** Groups whose members disagree about their current saved/ignored state. */
@@ -133,10 +159,18 @@ export class ShieldOptimizerAgent {
     alreadySaved: number,
     options: AgentOptions,
     config: CompiledScoringConfig,
+    omittedGroups = 0,
   ): BudgetReport {
     const proposedSaves = groups.filter((g) => g.recommendedAction === 'save').length;
     const limit = options.operationBudget;
     const notes: string[] = [];
+
+    if (omittedGroups > 0) {
+      notes.push(
+        `Budget covers all ${groups.length} analysed group(s); ${omittedGroups} are omitted from this ` +
+          'report by --max-groups and are still counted here.',
+      );
+    }
 
     if (limit === undefined) {
       notes.push(
@@ -164,18 +198,38 @@ export class ShieldOptimizerAgent {
 }
 
 /**
+ * Traffic level for filtering, or `null` when nothing is known.
+ *
+ * Absolute hits are preferred, but the discovery API only ever reports a rate,
+ * so a threshold that inspects `hits` alone is a silent no-op against a live
+ * zone. `null` is preserved so unknown traffic is never treated as zero.
+ */
+export function observedTrafficLevel(endpoint: Endpoint): number | null {
+  if (endpoint.hits !== null && endpoint.hits !== undefined) return endpoint.hits;
+  return requestsPerHour(endpoint);
+}
+
+/** Tier gap between actions, wider than every tiebreaker combined. */
+const ACTION_TIER_SPAN = 10;
+
+/**
  * Value ranking for budget allocation. Combines decision score, evidence
  * strength and traffic so the most defensible high-impact groups sort first.
+ *
+ * The action is a strict tier rather than one term among several. Budget slots
+ * are spent on saves, so a high-traffic `manual_review` must never sort above a
+ * `save`: the tiebreakers together span at most ~2.6, well inside the tier gap.
  */
 export function rankValue(group: NormalizedGroup): number {
-  const actionWeight = group.recommendedAction === 'save' ? 1 : group.recommendedAction === 'manual_review' ? 0.5 : 0;
+  const tier = group.recommendedAction === 'save' ? 2 : group.recommendedAction === 'manual_review' ? 1 : 0;
 
   // Traffic is the main proxy for "this matters". Absolute hits are preferred,
   // but the discovery API only reports a rate, so fall back to it — otherwise
   // every live endpoint contributes zero and ranking degenerates to path order.
   const hits = totalKnownHits(group.members);
   const magnitude = hits > 0 ? hits : (totalRequestsPerHour(group.members) ?? 0);
-  const trafficComponent = Math.log10(Math.max(1, magnitude)) / 8;
+  // Bounded so a very large zone cannot let traffic dominate the tiebreakers.
+  const trafficComponent = Math.min(1, Math.log10(Math.max(1, magnitude)) / 8);
 
-  return actionWeight * 2 + group.score.combined + group.confidence * 0.5 + trafficComponent;
+  return tier * ACTION_TIER_SPAN + group.score.combined + group.confidence * 0.5 + trafficComponent;
 }

@@ -1,5 +1,15 @@
-import type { ProposalBundle, Proposal } from './types.js';
-import { formatRate } from './classify.js';
+import type { Endpoint, ProposalBundle, Proposal } from './types.js';
+import { formatRate, requestsPerHour } from './classify.js';
+
+/**
+ * Traffic for one listed member. `hits` is always null in API mode, so a member
+ * with a known rate must not be printed as unmeasured.
+ */
+function memberTraffic(endpoint: Endpoint): string {
+  if (endpoint.hits !== null && endpoint.hits !== undefined) return `${endpoint.hits.toLocaleString()} hits`;
+  const rate = requestsPerHour(endpoint);
+  return rate === null ? 'no traffic data' : formatRate(rate);
+}
 
 /** Endpoints listed per proposal in the text report. */
 const MAX_LISTED_MEMBERS = 5;
@@ -110,8 +120,7 @@ function formatProposal(p: Proposal, opts: { verbose: boolean; maxMembers: numbe
   if (listed.length > 0) {
     lines.push('Sample endpoints:');
     for (const ep of listed) {
-      const hits = ep.hits === null || ep.hits === undefined ? 'no traffic data' : `${ep.hits.toLocaleString()} hits`;
-      lines.push(`  ${ep.method} ${ep.host}${ep.path}  (${hits})`);
+      lines.push(`  ${ep.method} ${ep.host}${ep.path}  (${memberTraffic(ep)})`);
     }
     const hidden = p.target.membersCount - listed.length;
     if (hidden > 0) {

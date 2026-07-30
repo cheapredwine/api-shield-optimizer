@@ -1,15 +1,26 @@
 {
   "name": "api-shield-optimizer",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Cloudflare API Shield endpoint optimization CLI — proposes which discovered endpoints to save or ignore",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
     "api-shield-optimizer": "dist/cli.js"
   },
-  "files": ["dist", "README.md"],
+  "files": ["dist", "README.md", "LICENSE"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cheapredwine/api-shield-optimizer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cheapredwine/api-shield-optimizer/issues"
+  },
+  "homepage": "https://github.com/cheapredwine/api-shield-optimizer#readme",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc -p tsconfig.build.json",
     "dev": "tsx src/cli.ts",
     "propose": "tsx src/cli.ts propose",
     "review": "tsx src/cli.ts review",

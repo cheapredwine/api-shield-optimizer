@@ -13,10 +13,19 @@ import {
   requestsPerHour,
   totalRequestsPerHour,
   formatRate,
+  computeTrafficThresholds,
 } from '../classify.js';
 import { rankValue, ShieldOptimizerAgent } from '../agent.js';
+import {
+  resolveScoringConfig,
+  validateScoringOverrides,
+  getDefaultCompiledConfig,
+  DEFAULT_SCORING_CONFIG,
+} from '../scoring-config.js';
+import { ValidationError } from '../validate.js';
 import { generateProposal, generateBundle } from '../proposal.js';
-import { bundleToCsv } from '../export.js';
+import { bundleToCsv, buildApplyPayload } from '../export.js';
+import { formatBundleAsText } from '../format.js';
 import type { Endpoint, NormalizedGroup, ProposalBundle } from '../types.js';
 import type { AgentOptions } from '../agent.js';
 
@@ -886,6 +895,54 @@ describe('sibling-based variable inference', () => {
     expect(pattern('/c/mens-shoes', corpus)).toBe('/c/{var1}');
   });
 
+  // Regression: stage 2 matched on prefix and position alone, so a static page
+  // sharing a collection prefix was absorbed into the identifier position. The
+  // operation then vanished from the report and its traffic was credited to the
+  // `{var1}` group.
+  it('leaves static pages beside an identifier family intact', () => {
+    const corpus = [
+      '/products/8813245',
+      '/products/8813246',
+      '/products/8813247',
+      '/products/8813248',
+      '/products/8813249',
+      '/products/clearance',
+      '/products/gift-guide',
+    ];
+    expect(pattern('/products/8813245', corpus)).toBe('/products/{var1}');
+    expect(pattern('/products/clearance', corpus)).toBe('/products/clearance');
+    expect(pattern('/products/gift-guide', corpus)).toBe('/products/gift-guide');
+  });
+
+  it('reports the static siblings as their own operations', () => {
+    const paths = [
+      '/products/8813245',
+      '/products/8813246',
+      '/products/8813247',
+      '/products/8813248',
+      '/products/8813249',
+      '/products/clearance',
+      '/products/gift-guide',
+    ];
+    const groups = groupEndpoints(paths.map((p) => makeEp({ path: p, host: 'shop.example.com' })));
+    const patterns = groups.map((g) => g.normalizedPathPattern).sort();
+    expect(patterns).toEqual(['/products/clearance', '/products/gift-guide', '/products/{var1}']);
+    expect(groups.find((g) => g.normalizedPathPattern === '/products/{var1}')!.members).toHaveLength(5);
+  });
+
+  // A lone static literal must not be swept up by siblings Cloudflare has
+  // already marked, so a shape needs two real values of its own.
+  it('does not let already-variable siblings absorb a single static literal', () => {
+    const corpus = [
+      '/items/{var1}',
+      '/items/{var1}/a',
+      '/items/{var1}/b',
+      '/items/{var1}/c',
+      '/items/settings',
+    ];
+    expect(pattern('/items/settings', corpus)).toBe('/items/settings');
+  });
+
   it('does not pool distinct resources that differ downstream', () => {
     const corpus = [
       '/products/list',
@@ -1225,5 +1282,578 @@ describe('bundleToCsv', () => {
   it('keeps a row per proposal', () => {
     const csv = bundleToCsv(bundleFor(sensitiveGroup()));
     expect(csv.trim().split('\n')).toHaveLength(2);
+  });
+});
+
+describe('scoring configuration overrides', () => {
+  // These come from a user-editable file and feed a security decision. A wrong
+  // number is more dangerous than a missing one: `apiFloor: -1` makes every path
+  // clear the floor, turning a privacy policy into a `save`.
+  it.each([
+    ['apiFloor below zero', { apiFloor: -1 }],
+    ['apiFloor above one', { apiFloor: 4 }],
+    ['saveThreshold not a number', { saveThreshold: 'high' as unknown as number }],
+    ['NaN threshold', { ignoreThreshold: Number.NaN }],
+    ['negative traffic threshold', { highTrafficRatePerHour: -5 }],
+    ['ignoreThreshold above saveThreshold', { ignoreThreshold: 0.9, saveThreshold: 0.5 }],
+    ['apiFloor above apiCertain', { apiFloor: 0.9, apiCertain: 0.5 }],
+    ['low rate above high rate', { lowTrafficRatePerHour: 5000 }],
+  ])('rejects %s', (_name, overrides) => {
+    expect(() => resolveScoringConfig(overrides)).toThrow(ValidationError);
+  });
+
+  it('names the offending key so the operator can fix the file', () => {
+    expect(() => resolveScoringConfig({ apiFloor: -1 })).toThrow(/apiFloor/);
+  });
+
+  it('accepts a legitimate override', () => {
+    const config = resolveScoringConfig({ saveThreshold: 0.7 });
+    expect(config.saveThreshold).toBe(0.7);
+    expect(config.apiFloor).toBe(DEFAULT_SCORING_CONFIG.apiFloor);
+  });
+
+  // `rulesetVersion` is the provenance of a recommendation. `review` warns on a
+  // mismatch, so a config file must not be able to claim a published version.
+  it('ignores an attempt to set rulesetVersion', () => {
+    const config = resolveScoringConfig({ rulesetVersion: '9.9.9' });
+    expect(config.rulesetVersion).not.toBe('9.9.9');
+  });
+
+  it('marks a customised ruleset so a report cannot pass as the published one', () => {
+    expect(resolveScoringConfig({ saveThreshold: 0.7 }).rulesetVersion).toBe(
+      `${DEFAULT_SCORING_CONFIG.rulesetVersion}+custom`,
+    );
+    expect(resolveScoringConfig().rulesetVersion).toBe(DEFAULT_SCORING_CONFIG.rulesetVersion);
+  });
+});
+
+describe('method set scoping', () => {
+  // Regression: the method set was keyed by path alone, so unrelated hosts
+  // pooled and `rest-method-set` was awarded to endpoints that serve one method.
+  it('does not share a method set across unrelated hosts', () => {
+    const groups = groupEndpoints([
+      makeEp({ host: 'api.acme.com', method: 'GET', path: '/orders' }),
+      makeEp({ host: 'blog.other.com', method: 'POST', path: '/orders' }),
+    ]);
+
+    expect(groups).toHaveLength(2);
+    for (const group of groups) {
+      expect(group.methodsOnPath).toEqual([group.method]);
+    }
+  });
+
+  it('still reports the full method set for one host', () => {
+    const groups = groupEndpoints([
+      makeEp({ host: 'api.acme.com', method: 'GET', path: '/orders' }),
+      makeEp({ host: 'api.acme.com', method: 'POST', path: '/orders' }),
+      makeEp({ host: 'api.acme.com', method: 'DELETE', path: '/orders' }),
+    ]);
+
+    for (const group of groups) {
+      expect(group.methodsOnPath).toEqual(['DELETE', 'GET', 'POST']);
+    }
+  });
+
+  it('withholds the rest-method-set signal from a single-method host', () => {
+    const [apiGroup] = groupEndpoints([
+      makeEp({ host: 'api.acme.com', method: 'GET', path: '/v1/orders' }),
+      makeEp({ host: 'blog.other.com', method: 'POST', path: '/v1/orders' }),
+    ]);
+    const signals = classifyGroup(apiGroup).signals.map((s) => s.id);
+    expect(signals).not.toContain('rest-method-set');
+  });
+});
+
+describe('budget and ranking', () => {
+  const agent = new ShieldOptimizerAgent();
+
+  // Distinct methods on one path, so each is its own group without tripping
+  // sibling inference on the path segments.
+  const saveable = (method: string) =>
+    makeEp({ host: 'api.example.com', method, path: '/api/v1/payments', id: `s-${method}` });
+
+  // Regression: the budget was counted after `maxGroups` truncation, so a
+  // report claimed slots that were already spoken for.
+  it('counts every analysed save in the budget, not just the reported ones', () => {
+    const endpoints = [saveable('GET'), saveable('POST'), saveable('PUT'), saveable('DELETE')];
+    const full = agent.analyze(endpoints, {
+      connectorConfig: { zoneId: 'a'.repeat(32) },
+      operationBudget: 10,
+    });
+    const truncated = agent.analyze(endpoints, {
+      connectorConfig: { zoneId: 'a'.repeat(32) },
+      operationBudget: 10,
+      maxGroups: 1,
+    });
+
+    expect(truncated.proposals).toHaveLength(1);
+    expect(truncated.budget!.proposedSaves).toBe(full.budget!.proposedSaves);
+    expect(truncated.budget!.remaining).toBe(full.budget!.remaining);
+    expect(truncated.budget!.notes.join(' ')).toMatch(/omitted from this report/);
+  });
+
+  // Regression: the traffic term spanned more than the action term, so a busy
+  // `manual_review` could outrank a `save` and take its budget slot.
+  it('never ranks a manual_review above a save', () => {
+    const busyReview: NormalizedGroup = makeGroup({
+      normalizedPathPattern: '/checkout/session/{var1}',
+      method: 'POST',
+      recommendedAction: 'manual_review',
+      confidence: 0.95,
+      score: { api: 1, sensitivity: 1, combined: 1 },
+      members: [
+        makeEp({
+          path: '/checkout/session/{var1}',
+          host: 'api.example.com',
+          method: 'POST',
+          hits: 1_000_000_000,
+          features: { periodRequests: 1_000_000_000, periodSeconds: 3600 },
+        }),
+      ],
+    });
+    const quietSave: NormalizedGroup = makeGroup({
+      normalizedPathPattern: '/api/v1/thing',
+      recommendedAction: 'save',
+      confidence: 0.05,
+      score: { api: 0.8, sensitivity: 0.2, combined: 0.62 },
+      members: [makeEp({ path: '/api/v1/thing', host: 'api.example.com', hits: null })],
+    });
+
+    expect(rankValue(quietSave)).toBeGreaterThan(rankValue(busyReview));
+  });
+
+  it('still orders two saves by traffic', () => {
+    const base = {
+      recommendedAction: 'save' as const,
+      confidence: 0.5,
+      score: { api: 0.9, sensitivity: 0.5, combined: 0.74 },
+    };
+    const busy = makeGroup({
+      ...base,
+      normalizedPathPattern: '/api/v1/busy',
+      members: [
+        makeEp({
+          path: '/api/v1/busy',
+          host: 'api.example.com',
+          hits: null,
+          features: { periodRequests: 900, periodSeconds: 3600 },
+        }),
+      ],
+    });
+    const quiet = makeGroup({
+      ...base,
+      normalizedPathPattern: '/api/v1/quiet',
+      members: [
+        makeEp({
+          path: '/api/v1/quiet',
+          host: 'api.example.com',
+          hits: null,
+          features: { periodRequests: 5, periodSeconds: 3600 },
+        }),
+      ],
+    });
+
+    expect(rankValue(busy)).toBeGreaterThan(rankValue(quiet));
+  });
+});
+
+describe('minHits filtering', () => {
+  const agent = new ShieldOptimizerAgent();
+  const opts = (minHits: number): AgentOptions => ({
+    connectorConfig: { zoneId: 'a'.repeat(32) },
+    minHits,
+  });
+
+  const withRate = (path: string, requests: number) =>
+    makeEp({
+      host: 'api.example.com',
+      path,
+      hits: null,
+      features: { periodRequests: requests, periodSeconds: 3600 },
+    });
+
+  // Regression: the filter inspected `hits` only, which is always null in API
+  // mode, so `--min-hits` silently did nothing against a live zone.
+  it('applies to the observed request rate when no absolute count exists', () => {
+    const bundle = agent.analyze([withRate('/api/v1/busy', 500), withRate('/api/v1/quiet', 2)], opts(100));
+    const patterns = bundle.proposals.map((p) => p.target.canonicalPattern).join(' ');
+    expect(patterns).toContain('/api/v1/busy');
+    expect(patterns).not.toContain('/api/v1/quiet');
+  });
+
+  it('retains endpoints whose traffic is unknown', () => {
+    const unknown = makeEp({ host: 'api.example.com', path: '/api/v1/managed', hits: null });
+    const bundle = agent.analyze([unknown], opts(100));
+    expect(bundle.proposals).toHaveLength(1);
+  });
+
+  it('still filters on an absolute count when one is reported', () => {
+    const bundle = agent.analyze(
+      [
+        makeEp({ host: 'api.example.com', path: '/api/v1/big', hits: 5000 }),
+        makeEp({ host: 'api.example.com', path: '/api/v1/small', hits: 3 }),
+      ],
+      opts(100),
+    );
+    const patterns = bundle.proposals.map((p) => p.target.canonicalPattern).join(' ');
+    expect(patterns).toContain('/api/v1/big');
+    expect(patterns).not.toContain('/api/v1/small');
+  });
+});
+
+describe('buildApplyPayload', () => {
+  const ZONE = 'a'.repeat(32);
+
+  const bundleOf = (groups: NormalizedGroup[]) => generateBundle(groups, { zoneId: ZONE });
+
+  const savedGroup = () =>
+    classify(
+      makeGroup({
+        normalizedPathPattern: '/api/v1/payments',
+        method: 'POST',
+        normalizedHostPattern: 'api.example.com',
+        members: [
+          makeEp({ id: 'disc-1', host: 'api.example.com', method: 'POST', path: '/api/v1/payments' }),
+        ],
+      }),
+    );
+
+  const ignoredGroup = () =>
+    classify(
+      makeGroup({
+        normalizedPathPattern: '/about-us',
+        normalizedHostPattern: 'www.example.com',
+        members: [
+          makeEp({ id: 'disc-2', host: 'www.example.com', method: 'GET', path: '/about-us', labels: ['cf-web-page'] }),
+        ],
+      }),
+    );
+
+  it('emits a POST for saves and a PATCH for ignores, and nothing else', () => {
+    const payload = buildApplyPayload(bundleOf([savedGroup(), ignoredGroup()]));
+    const methods = payload.requests.map((r) => r.method).sort();
+    expect(methods).toEqual(['PATCH', 'POST']);
+    expect(payload.saveOperations).toEqual([
+      { host: 'api.example.com', method: 'POST', endpoint: '/api/v1/payments' },
+    ]);
+    expect(payload.ignoreOperationStates).toEqual({ 'disc-2': { state: 'ignored' } });
+  });
+
+  it('targets the zone from the bundle', () => {
+    const payload = buildApplyPayload(bundleOf([savedGroup()]));
+    expect(payload.zoneId).toBe(ZONE);
+    for (const request of payload.requests) {
+      expect(request.url).toContain(`/zones/${ZONE}/api_gateway`);
+    }
+  });
+
+  // A bundle produced without a zone must not silently build `/zones//...`.
+  it('uses a visible placeholder when the bundle carries no zone', () => {
+    const payload = buildApplyPayload(generateBundle([savedGroup()], {}));
+    expect(payload.zoneId).toBe('{zoneId}');
+    expect(payload.requests.every((r) => !r.url.includes('/zones//'))).toBe(true);
+  });
+
+  // The tool never transmits anything, so the preview must not carry a token.
+  it('never embeds a real token in the curl preview', () => {
+    const payload = buildApplyPayload(bundleOf([savedGroup()]));
+    for (const request of payload.requests) {
+      expect(request.curl).toContain('$CF_API_TOKEN');
+      expect(request.headers.Authorization).toBe('Bearer $CF_API_TOKEN');
+    }
+  });
+
+  it('states that nothing was applied', () => {
+    expect(buildApplyPayload(bundleOf([savedGroup()])).warning).toMatch(/never writes to the Cloudflare API/);
+  });
+
+  it('excludes manual_review from the payload', () => {
+    const review = classify(
+      makeGroup({
+        normalizedPathPattern: '/checkout/session/{var1}',
+        method: 'POST',
+        normalizedHostPattern: 'shop.example.com',
+        members: [makeEp({ id: 'disc-3', host: 'shop.example.com', method: 'POST', path: '/checkout/session/{var1}' })],
+      }),
+    );
+    expect(review.recommendedAction).toBe('manual_review');
+
+    const payload = buildApplyPayload(bundleOf([review]));
+    expect(payload.saveOperations).toHaveLength(0);
+    expect(payload.ignoreOperationStates).toEqual({});
+  });
+
+  it('lets a decision override the recommendation', () => {
+    const group = ignoredGroup();
+    const bundle = bundleOf([group]);
+    const payload = buildApplyPayload(bundle, {
+      decisions: {
+        rulesetVersion: DEFAULT_SCORING_CONFIG.rulesetVersion,
+        decidedAt: new Date().toISOString(),
+        decisions: [
+          {
+            groupId: group.groupId,
+            canonicalPattern: 'www.example.com/about-us',
+            method: 'GET',
+            decision: 'save',
+            recommendedAction: 'ignore',
+            decidedAt: new Date().toISOString(),
+          },
+        ],
+      },
+    });
+    expect(payload.saveOperations).toHaveLength(1);
+    expect(payload.ignoreOperationStates).toEqual({});
+  });
+
+  it('skips a save it cannot turn into a concrete operation', () => {
+    const consolidated = classify(
+      makeGroup({
+        normalizedPathPattern: '/api/v1/things',
+        method: 'POST',
+        normalizedHostPattern: '{hostVar1}.example.com',
+        members: [makeEp({ id: 'disc-4', host: '', method: 'POST', path: '/api/v1/things' })],
+      }),
+    );
+    expect(consolidated.recommendedAction).toBe('save');
+    const payload = buildApplyPayload(bundleOf([consolidated]), { actions: ['save'] });
+    expect(payload.saveOperations).toHaveLength(0);
+    expect(payload.skipped.map((s) => s.reason).join(' ')).toMatch(/hostname variable/);
+  });
+
+  it('counts skipped proposals rather than dropping them silently', () => {
+    const payload = buildApplyPayload(bundleOf([savedGroup()]), { minConfidence: 0.99 });
+    expect(payload.counts.save).toBe(0);
+    expect(payload.counts.skipped).toBe(1);
+    expect(payload.skipped[0].reason).toMatch(/below --min-confidence/);
+  });
+});
+
+describe('formatBundleAsText', () => {
+  const bundle = () =>
+    generateBundle(
+      [
+        classify(
+          makeGroup({
+            normalizedPathPattern: '/api/v1/payments',
+            method: 'POST',
+            normalizedHostPattern: 'api.example.com',
+            members: [makeEp({ host: 'api.example.com', method: 'POST', path: '/api/v1/payments', hits: 4000 })],
+          }),
+        ),
+      ],
+      {
+        zoneId: 'a'.repeat(32),
+        budget: {
+          limit: 10,
+          alreadySaved: 0,
+          proposedSaves: 1,
+          remaining: 9,
+          overBudget: false,
+          notes: ['9 operation slot(s) remain after applying the proposed saves.'],
+        },
+      },
+    );
+
+  it('reports the ruleset that produced it', () => {
+    expect(formatBundleAsText(bundle())).toContain(DEFAULT_SCORING_CONFIG.rulesetVersion);
+  });
+
+  it('shows the action, pattern and score for each proposal', () => {
+    const text = formatBundleAsText(bundle());
+    expect(text).toContain('SAVE');
+    expect(text).toContain('api.example.com/api/v1/payments');
+    expect(text).toMatch(/API:\s+\d\.\d\d/);
+  });
+
+  it('summarises counts and the operation budget', () => {
+    const text = formatBundleAsText(bundle());
+    expect(text).toContain('SUMMARY');
+    expect(text).toContain('OPERATION BUDGET');
+  });
+
+  // `hits` is null in API mode; a report must not print a measured-looking zero.
+  it('does not claim zero traffic when traffic is unknown', () => {
+    const unknown = generateBundle(
+      [
+        classify(
+          makeGroup({
+            normalizedPathPattern: '/api/v1/managed',
+            normalizedHostPattern: 'api.example.com',
+            members: [makeEp({ host: 'api.example.com', path: '/api/v1/managed', hits: null })],
+          }),
+        ),
+      ],
+      { zoneId: 'a'.repeat(32) },
+    );
+    expect(formatBundleAsText(unknown)).not.toMatch(/Total Hits:\s+0/);
+  });
+
+  it('lists every proposal', () => {
+    const text = formatBundleAsText(bundle());
+    expect(text).toMatch(/PROPOSAL 1 of 1/);
+  });
+});
+
+describe('percentile-relative traffic thresholds', () => {
+  const config = getDefaultCompiledConfig();
+
+  const groupAtRate = (path: string, ratePerHour: number) =>
+    makeGroup({
+      normalizedPathPattern: path,
+      members: [
+        // `hits` is null in API mode, so a rate is the only traffic evidence.
+        makeEp({
+          host: 'api.example.com',
+          path,
+          hits: null,
+          features: { periodRequests: ratePerHour, periodSeconds: 3600 },
+        }),
+      ],
+    });
+
+  // A busy zone: every endpoint is far above the absolute 1000 req/hour mark, so
+  // the absolute thresholds cannot tell the busiest apart from the quietest.
+  const busyZone = () =>
+    Array.from({ length: 40 }, (_, i) => groupAtRate(`/api/v1/r${i}`, 100_000 + i * 100_000));
+
+  it('derives thresholds from the zone when there are enough samples', () => {
+    const thresholds = computeTrafficThresholds(busyZone(), config);
+    expect(thresholds.relative).toBe(true);
+    expect(thresholds.highRatePerHour).toBeGreaterThan(config.highTrafficRatePerHour);
+    expect(thresholds.lowRatePerHour).toBeGreaterThan(config.lowTrafficRatePerHour);
+  });
+
+  it('keeps the absolute thresholds when too few endpoints report a rate', () => {
+    const thresholds = computeTrafficThresholds([groupAtRate('/api/v1/a', 5000)], config);
+    expect(thresholds.relative).toBe(false);
+    expect(thresholds.highRatePerHour).toBe(config.highTrafficRatePerHour);
+    expect(thresholds.lowRatePerHour).toBe(config.lowTrafficRatePerHour);
+  });
+
+  it('keeps the absolute thresholds when every endpoint reports the same rate', () => {
+    const flat = Array.from({ length: 40 }, (_, i) => groupAtRate(`/api/v1/r${i}`, 500));
+    expect(computeTrafficThresholds(flat, config).relative).toBe(false);
+  });
+
+  it('ignores endpoints with unknown traffic when computing percentiles', () => {
+    const withUnknown = [
+      ...busyZone(),
+      ...Array.from({ length: 100 }, (_, i) =>
+        makeGroup({
+          normalizedPathPattern: `/api/v1/managed${i}`,
+          members: [makeEp({ host: 'api.example.com', path: `/api/v1/managed${i}`, hits: null })],
+        }),
+      ),
+    ];
+    const thresholds = computeTrafficThresholds(withUnknown, config);
+    expect(thresholds).toEqual(computeTrafficThresholds(busyZone(), config));
+  });
+
+  // The saturation this replaces: on a busy zone the absolute mark flags
+  // everything, so `high-traffic-rate` stops carrying information.
+  it('stops flagging every endpoint as high traffic on a busy zone', () => {
+    const groups = busyZone();
+    const absoluteFlagged = groups.filter((g) =>
+      classifyGroup(g, config).signals.some((s) => s.id === 'high-traffic-rate'),
+    );
+    expect(absoluteFlagged).toHaveLength(groups.length);
+
+    const thresholds = computeTrafficThresholds(groups, config);
+    const relativeFlagged = groups.filter((g) =>
+      classifyGroup(g, config, thresholds).signals.some((s) => s.id === 'high-traffic-rate'),
+    );
+    expect(relativeFlagged.length).toBeGreaterThan(0);
+    expect(relativeFlagged.length).toBeLessThan(groups.length);
+  });
+
+  it('still flags the busiest endpoints, not an arbitrary subset', () => {
+    const groups = busyZone();
+    const thresholds = computeTrafficThresholds(groups, config);
+    const flagged = groups.filter((g) =>
+      classifyGroup(g, config, thresholds).signals.some((s) => s.id === 'high-traffic-rate'),
+    );
+    // The zone is built in ascending rate order, so the flagged set is its tail.
+    expect(flagged).toEqual(groups.slice(groups.length - flagged.length));
+  });
+
+  it('names the zone in the signal detail when the threshold is relative', () => {
+    const groups = busyZone();
+    const thresholds = computeTrafficThresholds(groups, config);
+    const busiest = classifyGroup(groups[groups.length - 1], config, thresholds);
+    const signal = busiest.signals.find((s) => s.id === 'high-traffic-rate');
+    expect(signal?.detail).toMatch(/of this zone/);
+  });
+
+  it('stops flagging the whole zone as low traffic on a quiet zone', () => {
+    const quiet = Array.from({ length: 40 }, (_, i) => groupAtRate(`/api/v1/r${i}`, 0.01 + i * 0.01));
+    const absolute = quiet.filter((g) => classifyGroup(g, config).flags.includes('low-traffic'));
+    expect(absolute).toHaveLength(quiet.length);
+
+    const thresholds = computeTrafficThresholds(quiet, config);
+    const relative = quiet.filter((g) => classifyGroup(g, config, thresholds).flags.includes('low-traffic'));
+    expect(relative.length).toBeLessThan(quiet.length);
+  });
+
+  it('rejects an inverted percentile pair', () => {
+    expect(() =>
+      validateScoringOverrides({ lowTrafficPercentile: 0.9, highTrafficPercentile: 0.2 }),
+    ).toThrow(/lowTrafficPercentile/);
+  });
+
+  it('rejects a percentile outside the unit interval', () => {
+    expect(() => validateScoringOverrides({ highTrafficPercentile: 12 })).toThrow(/highTrafficPercentile/);
+  });
+});
+
+describe('member traffic in the text report', () => {
+  const bundleWithRate = () =>
+    generateBundle(
+      [
+        classify(
+          makeGroup({
+            normalizedPathPattern: '/api/v1/items',
+            normalizedHostPattern: 'api.example.com',
+            members: [
+              makeEp({
+                host: 'api.example.com',
+                path: '/api/v1/items',
+                hits: null,
+                features: { periodRequests: 3600, periodSeconds: 3600 },
+              }),
+            ],
+          }),
+        ),
+      ],
+      { zoneId: 'a'.repeat(32) },
+    );
+
+  // Regression: the member list inspected `hits` only, so in API mode — where
+  // `hits` is always null — every endpoint was printed as unmeasured beside a
+  // group summary that reported its rate.
+  it('prints the rate for a member whose hits are unknown', () => {
+    const text = formatBundleAsText(bundleWithRate());
+    const memberLine = text.split('\n').find((l) => l.includes('GET api.example.com/api/v1/items  ('));
+    expect(memberLine).toBeDefined();
+    expect(memberLine).not.toContain('no traffic data');
+    expect(memberLine).toMatch(/req\/hour/);
+  });
+
+  it('still says so when neither a count nor a rate is known', () => {
+    const bundle = generateBundle(
+      [
+        classify(
+          makeGroup({
+            normalizedPathPattern: '/api/v1/managed',
+            normalizedHostPattern: 'api.example.com',
+            members: [makeEp({ host: 'api.example.com', path: '/api/v1/managed', hits: null })],
+          }),
+        ),
+      ],
+      { zoneId: 'a'.repeat(32) },
+    );
+    const text = formatBundleAsText(bundle);
+    const memberLine = text.split('\n').find((l) => l.includes('GET api.example.com/api/v1/managed  ('));
+    expect(memberLine).toContain('no traffic data');
   });
 });

@@ -3,6 +3,17 @@ import { getDefaultCompiledConfig, type CompiledScoringConfig } from './scoring-
 
 const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
+/**
+ * Rate thresholds for one zone. Derived from the zone's own distribution when
+ * there are enough samples, otherwise the absolute values from the config.
+ */
+export interface TrafficThresholds {
+  highRatePerHour: number;
+  lowRatePerHour: number;
+  /** True when the thresholds came from the zone's own distribution. */
+  relative: boolean;
+}
+
 export interface ClassificationResult {
   action: Action;
   confidence: number;
@@ -56,6 +67,54 @@ export function totalRequestsPerHour(members: Endpoint[]): number | null {
     }
   }
   return known ? total : null;
+}
+
+/** Linear-interpolated percentile of an unsorted sample. */
+function percentile(values: number[], fraction: number): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  if (sorted.length === 1) return sorted[0];
+  const position = fraction * (sorted.length - 1);
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return sorted[lower];
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
+}
+
+/**
+ * Derives the traffic thresholds for a zone from the rates it actually reports.
+ *
+ * The absolute defaults (1000 and 1 req/hour) saturate: on a zone serving
+ * billions of requests every endpoint is "high traffic" and nothing is
+ * "negligible", so both signals carry no information at exactly the scale where
+ * prioritisation matters most. Percentiles stay meaningful at any volume.
+ *
+ * Falls back to the absolute values when too few endpoints report a rate, since a
+ * percentile over a handful of samples describes the sample, not the zone.
+ */
+export function computeTrafficThresholds(
+  groups: NormalizedGroup[],
+  config: CompiledScoringConfig = getDefaultCompiledConfig(),
+): TrafficThresholds {
+  const absolute: TrafficThresholds = {
+    highRatePerHour: config.highTrafficRatePerHour,
+    lowRatePerHour: config.lowTrafficRatePerHour,
+    relative: false,
+  };
+
+  const rates = groups
+    .map((group) => totalRequestsPerHour(group.members))
+    .filter((rate): rate is number => rate !== null);
+
+  if (rates.length < config.trafficPercentileMinSamples) return absolute;
+
+  const high = percentile(rates, config.highTrafficPercentile);
+  const low = percentile(rates, config.lowTrafficPercentile);
+
+  // A flat distribution gives high === low, which would make every endpoint both
+  // busy and negligible. Keep the absolute values rather than emit both signals.
+  if (!(high > low)) return absolute;
+
+  return { highRatePerHour: high, lowRatePerHour: low, relative: true };
 }
 
 /** Human-readable request rate for signal explanations. */
@@ -141,6 +200,11 @@ function aggregate(members: Endpoint[]): AggregatedEvidence {
 export function classifyGroup(
   group: NormalizedGroup,
   config: CompiledScoringConfig = getDefaultCompiledConfig(),
+  traffic: TrafficThresholds = {
+    highRatePerHour: config.highTrafficRatePerHour,
+    lowRatePerHour: config.lowTrafficRatePerHour,
+    relative: false,
+  },
 ): ClassificationResult {
   const signals: Signal[] = [];
   const flags: string[] = [];
@@ -248,12 +312,15 @@ export function classifyGroup(
 
   if (evidence.totalHits >= config.highTrafficHits) {
     add('sensitivity', 'high-traffic', 0.1, `high traffic volume (${evidence.totalHits.toLocaleString()} hits)`);
-  } else if (evidence.ratePerHour !== null && evidence.ratePerHour >= config.highTrafficRatePerHour) {
+  } else if (evidence.ratePerHour !== null && evidence.ratePerHour >= traffic.highRatePerHour) {
     add(
       'sensitivity',
       'high-traffic-rate',
       0.1,
-      `high request rate (${formatRate(evidence.ratePerHour)})`,
+      traffic.relative
+        ? `high request rate (${formatRate(evidence.ratePerHour)}, ` +
+          `top ${Math.round((1 - config.highTrafficPercentile) * 100)}% of this zone)`
+        : `high request rate (${formatRate(evidence.ratePerHour)})`,
     );
   }
 
@@ -356,7 +423,7 @@ export function classifyGroup(
 
   // --------------------------------------------------------------- Confidence
 
-  const confidence = computeConfidence(group, evidence, config, flags);
+  const confidence = computeConfidence(group, evidence, config, traffic, flags);
 
   return { action, confidence, score, signals, reasoning, flags: [...new Set(flags)] };
 }
@@ -372,6 +439,7 @@ function computeConfidence(
   group: NormalizedGroup,
   evidence: AggregatedEvidence,
   config: CompiledScoringConfig,
+  traffic: TrafficThresholds,
   flags: string[],
 ): number {
   let confidence = 0.3;
@@ -390,7 +458,7 @@ function computeConfidence(
     const negligible =
       evidence.totalHits > 0
         ? evidence.totalHits < config.lowTrafficHits
-        : evidence.ratePerHour !== null && evidence.ratePerHour < config.lowTrafficRatePerHour;
+        : evidence.ratePerHour !== null && evidence.ratePerHour < traffic.lowRatePerHour;
 
     if (negligible) {
       confidence -= 0.1;

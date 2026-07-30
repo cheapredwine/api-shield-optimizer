@@ -104,10 +104,27 @@ interface PaginatedResult<T> {
 }
 
 export interface EndpointFetchStats {
-  discovery: { pagesFetched: number; operationCount: number };
-  managed: { pagesFetched: number; operationCount: number };
+  discovery: { pagesFetched: number; operationCount: number; discarded: number; truncated: boolean };
+  managed: { pagesFetched: number; operationCount: number; discarded: number; truncated: boolean };
   merged: { endpointCount: number };
   schemas?: { schemaCount: number; operationCount: number };
+}
+
+/** Validated credentials and identifiers for one run of requests. */
+interface RequestScope {
+  apiToken: string;
+  zoneId: string;
+  accountId?: string;
+  states: string[];
+  onWarning?: (message: string) => void;
+}
+
+/** One page-limited fetch plus the metadata the operator needs about it. */
+interface OperationFetch {
+  endpoints: Endpoint[];
+  pagesFetched: number;
+  discarded: number;
+  truncated: boolean;
 }
 
 export class CloudflareApiError extends Error {
@@ -136,6 +153,57 @@ function normalizePath(path: string | undefined): string {
   const p = (path ?? '/').trim();
   if (p.length === 0) return '/';
   return p.startsWith('/') ? p : `/${p}`;
+}
+
+/**
+ * An operation is identified by host, method and path. A record missing any of
+ * them is not a usable operation, and defaulting the gaps invents one:
+ * `{host: '', method: 'GET', path: '/'}` looks plausible, groups with real
+ * traffic, and can reach the export payload as an operation to save.
+ */
+function isUsableOperation(op: { host?: string; method?: string; endpoint?: string }): boolean {
+  return (
+    typeof op.host === 'string' &&
+    canonicalizeHost(op.host).length > 0 &&
+    typeof op.method === 'string' &&
+    op.method.trim().length > 0 &&
+    typeof op.endpoint === 'string' &&
+    op.endpoint.trim().length > 0
+  );
+}
+
+/**
+ * A zone past the pagination cap is analysed on partial data, which is exactly
+ * the situation where a missing endpoint matters most.
+ */
+function warnIfTruncated(
+  result: { truncated: boolean; pagesFetched: number },
+  label: string,
+  onWarning?: (message: string) => void,
+): void {
+  if (!result.truncated) return;
+  onWarning?.(
+    `The ${label} operation list exceeded the ${MAX_PAGES}-page fetch cap ` +
+      `(${MAX_PAGES * PER_PAGE} operations). Results are incomplete and any endpoint ` +
+      'beyond the cap is missing from this analysis.',
+  );
+}
+
+/** Drops unusable records, reporting how many rather than failing silently. */
+function usableOperations<T extends { host?: string; method?: string; endpoint?: string }>(
+  operations: T[],
+  label: string,
+  onWarning?: (message: string) => void,
+): T[] {
+  const usable = operations.filter(isUsableOperation);
+  const discarded = operations.length - usable.length;
+  if (discarded > 0) {
+    onWarning?.(
+      `Discarded ${discarded} malformed ${label} record(s) missing a host, method or path. ` +
+        'They are not analysed and cannot appear in the export payload.',
+    );
+  }
+  return usable;
 }
 
 function mapEndpointStatus(state: string | undefined): Endpoint['status'] {
@@ -203,6 +271,18 @@ function mergeLabels(a: string[] | undefined, b: string[] | undefined): string[]
   return merged.length > 0 ? merged : undefined;
 }
 
+/**
+ * Adds two hit counts, preserving `null` for unknown.
+ *
+ * `null` means "not reported", not "zero". The discovery API never reports an
+ * absolute count, so coercing to `0` here would stamp a measured-looking zero
+ * onto every deduplicated operation and make `hasTrafficData` lie.
+ */
+function sumKnownHits(a: number | null, b: number | null): number | null {
+  if (a === null && b === null) return null;
+  return (a ?? 0) + (b ?? 0);
+}
+
 /** Canonical key for matching the same operation across API surfaces. */
 function shapeKey(host: string, method: string, path: string): string {
   return JSON.stringify([method.toUpperCase(), host.toLowerCase(), path]);
@@ -241,10 +321,14 @@ export class CloudflareApiConnector implements DataConnector {
       discovery: {
         pagesFetched: discovery.pagesFetched,
         operationCount: discovery.endpoints.length,
+        discarded: discovery.discarded,
+        truncated: discovery.truncated,
       },
       managed: {
         pagesFetched: managed.pagesFetched,
         operationCount: managed.endpoints.length,
+        discarded: managed.discarded,
+        truncated: managed.truncated,
       },
       merged: {
         endpointCount: merged.length,
@@ -267,7 +351,7 @@ export class CloudflareApiConnector implements DataConnector {
    * unvalidated identifier redirect the request to an arbitrary Cloudflare API
    * endpoint using this token.
    */
-  private resolveScope(config: ConnectorConfig): { apiToken: string; zoneId: string; accountId?: string; states: string[] } {
+  private resolveScope(config: ConnectorConfig): RequestScope {
     if (!config.apiToken) {
       throw new Error('apiToken required for API mode');
     }
@@ -276,6 +360,7 @@ export class CloudflareApiConnector implements DataConnector {
       zoneId: assertCloudflareId(config.zoneId, 'zoneId'),
       accountId: assertOptionalCloudflareId(config.accountId, 'accountId'),
       states: parseDiscoveryStates(config.state),
+      onWarning: config.onWarning,
     };
   }
 
@@ -296,7 +381,7 @@ export class CloudflareApiConnector implements DataConnector {
       }
       byShape.set(key, {
         ...existing,
-        hits: (existing.hits ?? 0) + (ep.hits ?? 0),
+        hits: sumKnownHits(existing.hits, ep.hits),
         features: existing.features ?? ep.features,
         status: existing.status ?? ep.status,
         labels: mergeLabels(existing.labels, ep.labels),
@@ -326,22 +411,21 @@ export class CloudflareApiConnector implements DataConnector {
     return [...byShape.values()];
   }
 
-  private async fetchDiscoveryOperations(scope: {
-    apiToken: string;
-    zoneId: string;
-    accountId?: string;
-    states: string[];
-  }): Promise<{ endpoints: Endpoint[]; pagesFetched: number }> {
+  private async fetchDiscoveryOperations(scope: RequestScope): Promise<OperationFetch> {
     const url = new URL(`${API_BASE}/zones/${scope.zoneId}/api_gateway/discovery/operations`);
     for (const state of scope.states) {
       url.searchParams.append('state', state);
     }
 
     const operations = await this.fetchPaginated<DiscoveryOperation>(url, scope.apiToken, true);
+    warnIfTruncated(operations, 'discovery', scope.onWarning);
+    const items = usableOperations(operations.items, 'discovery', scope.onWarning);
 
     return {
       pagesFetched: operations.pagesFetched,
-      endpoints: operations.items.map((op, idx) => ({
+      discarded: operations.items.length - items.length,
+      truncated: operations.truncated,
+      endpoints: items.map((op, idx) => ({
         id: op.id ?? `generated-${idx}`,
         accountId: scope.accountId ?? '',
         zoneId: scope.zoneId,
@@ -362,17 +446,17 @@ export class CloudflareApiConnector implements DataConnector {
     };
   }
 
-  private async fetchManagedOperations(scope: {
-    apiToken: string;
-    zoneId: string;
-    accountId?: string;
-  }): Promise<{ endpoints: Endpoint[]; pagesFetched: number }> {
+  private async fetchManagedOperations(scope: RequestScope): Promise<OperationFetch> {
     const url = new URL(`${API_BASE}/zones/${scope.zoneId}/api_gateway/operations`);
     const operations = await this.fetchPaginated<ManagedOperation>(url, scope.apiToken, false);
+    warnIfTruncated(operations, 'managed', scope.onWarning);
+    const items = usableOperations(operations.items, 'managed', scope.onWarning);
 
     return {
       pagesFetched: operations.pagesFetched,
-      endpoints: operations.items.map((op, idx) => ({
+      discarded: operations.items.length - items.length,
+      truncated: operations.truncated,
+      endpoints: items.map((op, idx) => ({
         id: op.operation_id ?? `managed-${idx}`,
         accountId: scope.accountId ?? '',
         zoneId: scope.zoneId,

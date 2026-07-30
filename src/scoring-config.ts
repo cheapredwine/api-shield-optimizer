@@ -5,6 +5,7 @@
  * without editing classifier logic. `rulesetVersion` is embedded in every
  * proposal bundle so results stay reproducible across releases.
  */
+import { ValidationError } from './validate.js';
 
 export interface PatternRule {
   id: string;
@@ -70,6 +71,22 @@ export interface ScoringConfig {
   highTrafficRatePerHour: number;
   lowTrafficRatePerHour: number;
 
+  /**
+   * Percentiles used to derive per-zone traffic thresholds. The absolute rates
+   * above are a fallback: on a zone serving billions of requests every endpoint
+   * clears `highTrafficRatePerHour` and none falls below `lowTrafficRatePerHour`,
+   * so both signals stop discriminating. A percentile is relative to the zone and
+   * keeps separating the busy endpoints from the quiet ones at any volume.
+   */
+  highTrafficPercentile: number;
+  lowTrafficPercentile: number;
+  /**
+   * Endpoints with a known rate required before percentiles are used. Below this
+   * a percentile is an artefact of a handful of samples, so the absolute rates
+   * are kept instead.
+   */
+  trafficPercentileMinSamples: number;
+
   staleAfterDays: number;
   freshWithinDays: number;
 
@@ -117,7 +134,7 @@ export interface ScoringConfig {
  * hit `/user-guide`.
  */
 export const DEFAULT_SCORING_CONFIG: ScoringConfig = {
-  rulesetVersion: '2.5.0',
+  rulesetVersion: '2.6.0',
 
   baseApiScore: 0.35,
   baseSensitivityScore: 0.2,
@@ -141,6 +158,10 @@ export const DEFAULT_SCORING_CONFIG: ScoringConfig = {
 
   highTrafficRatePerHour: 1000,
   lowTrafficRatePerHour: 1,
+
+  highTrafficPercentile: 0.9,
+  lowTrafficPercentile: 0.25,
+  trafficPercentileMinSamples: 20,
 
   staleAfterDays: 90,
   freshWithinDays: 14,
@@ -365,13 +386,111 @@ export function compileScoringConfig(config: ScoringConfig = DEFAULT_SCORING_CON
   };
 }
 
+/** Tunables that are a probability or a score, so must lie within [0, 1]. */
+const UNIT_INTERVAL_KEYS = [
+  'baseApiScore',
+  'baseSensitivityScore',
+  'apiWeight',
+  'sensitivityWeight',
+  'apiFloor',
+  'sensitivityRescueThreshold',
+  'sensitivityRescueApiFloor',
+  'apiCertain',
+  'saveThreshold',
+  'ignoreThreshold',
+  'siblingBoost',
+  'siblingSourceMin',
+  'highTrafficPercentile',
+  'lowTrafficPercentile',
+] as const satisfies readonly (keyof ScoringConfig)[];
+
+/** Tunables that count something, so must be a non-negative finite number. */
+const NON_NEGATIVE_KEYS = [
+  'highTrafficHits',
+  'lowTrafficHits',
+  'highTrafficRatePerHour',
+  'lowTrafficRatePerHour',
+  'staleAfterDays',
+  'freshWithinDays',
+  'trafficPercentileMinSamples',
+] as const satisfies readonly (keyof ScoringConfig)[];
+
+/**
+ * Rejects an override that would invert the meaning of a decision.
+ *
+ * These values come from a user-editable config file and feed a security tool.
+ * `apiFloor: -1` makes every path clear the floor, which turns a privacy policy
+ * into a `save`; `saveThreshold: 0` saves the entire zone. A wrong number here is
+ * far more dangerous than a missing one, so fail loudly instead of clamping.
+ */
+export function validateScoringOverrides(overrides: Partial<ScoringConfig>): void {
+  const problems: string[] = [];
+
+  for (const key of UNIT_INTERVAL_KEYS) {
+    const value = overrides[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+      problems.push(`${key} must be a number between 0 and 1 (got ${JSON.stringify(value)})`);
+    }
+  }
+
+  for (const key of NON_NEGATIVE_KEYS) {
+    const value = overrides[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      problems.push(`${key} must be a non-negative number (got ${JSON.stringify(value)})`);
+    }
+  }
+
+  const merged = { ...DEFAULT_SCORING_CONFIG, ...overrides };
+  if (merged.ignoreThreshold > merged.saveThreshold) {
+    problems.push(
+      `ignoreThreshold (${merged.ignoreThreshold}) must not exceed saveThreshold (${merged.saveThreshold})`,
+    );
+  }
+  if (merged.apiFloor > merged.apiCertain) {
+    problems.push(`apiFloor (${merged.apiFloor}) must not exceed apiCertain (${merged.apiCertain})`);
+  }
+  if (merged.lowTrafficRatePerHour > merged.highTrafficRatePerHour) {
+    problems.push(
+      `lowTrafficRatePerHour (${merged.lowTrafficRatePerHour}) must not exceed ` +
+        `highTrafficRatePerHour (${merged.highTrafficRatePerHour})`,
+    );
+  }
+  if (merged.lowTrafficPercentile > merged.highTrafficPercentile) {
+    problems.push(
+      `lowTrafficPercentile (${merged.lowTrafficPercentile}) must not exceed ` +
+        `highTrafficPercentile (${merged.highTrafficPercentile})`,
+    );
+  }
+
+  if (problems.length > 0) {
+    throw new ValidationError(`Invalid scoring configuration:\n  - ${problems.join('\n  - ')}`);
+  }
+}
+
 /**
  * Merges a partial user override onto the defaults. Pattern arrays replace
  * wholesale rather than merging, so an operator can fully control them.
+ *
+ * `rulesetVersion` is deliberately not overridable. It is stamped into every
+ * bundle and decision file as the provenance of a recommendation, and `review`
+ * warns when it does not match; letting a config file set it would let modified
+ * weights masquerade as a published ruleset.
  */
 export function resolveScoringConfig(overrides?: Partial<ScoringConfig>): CompiledScoringConfig {
   if (!overrides) return compileScoringConfig(DEFAULT_SCORING_CONFIG);
-  return compileScoringConfig({ ...DEFAULT_SCORING_CONFIG, ...overrides });
+  validateScoringOverrides(overrides);
+  const { rulesetVersion: _ignored, ...safe } = overrides;
+  const merged = { ...DEFAULT_SCORING_CONFIG, ...safe };
+  // Modified weights are not the published ruleset, and a report must say so.
+  const customised = Object.keys(safe).length > 0;
+  return compileScoringConfig({
+    ...merged,
+    rulesetVersion: customised
+      ? `${DEFAULT_SCORING_CONFIG.rulesetVersion}+custom`
+      : DEFAULT_SCORING_CONFIG.rulesetVersion,
+  });
 }
 
 let defaultCompiled: CompiledScoringConfig | null = null;

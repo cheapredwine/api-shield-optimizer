@@ -339,6 +339,8 @@ async function buildConnectorConfig(
     zoneId,
     state: parseDiscoveryStates(opts.state ?? fileConfig.state ?? undefined).join(','),
     useSchemas: opts.schemas === false ? false : (fileConfig.useSchemas ?? true),
+    // stderr, so `--output -` keeps a clean report on stdout.
+    onWarning: (message) => console.error(`Warning: ${message}`),
   };
 }
 
@@ -601,6 +603,14 @@ program
     console.log(`Merged endpoints:     ${stats.merged.endpointCount}`);
     if (stats.schemas) {
       console.log(`Uploaded schemas:     ${stats.schemas.schemaCount} (operations: ${stats.schemas.operationCount})`);
+    }
+
+    const discarded = stats.discovery.discarded + stats.managed.discarded;
+    if (discarded > 0) {
+      console.log(`Discarded records:    ${discarded} (malformed, missing host/method/path)`);
+    }
+    if (stats.discovery.truncated || stats.managed.truncated) {
+      console.log('Truncated:            YES — the zone exceeds the fetch cap, results are partial');
     }
   });
 

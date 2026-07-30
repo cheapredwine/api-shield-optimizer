@@ -339,10 +339,59 @@ describe('CloudflareApiConnector pagination and mapping', () => {
 
     const stats = await new CloudflareApiConnector().fetchEndpointStats(baseConfig());
     expect(stats).toEqual({
-      discovery: { pagesFetched: 1, operationCount: 1 },
-      managed: { pagesFetched: 1, operationCount: 1 },
+      discovery: { pagesFetched: 1, operationCount: 1, discarded: 0, truncated: false },
+      managed: { pagesFetched: 1, operationCount: 1, discarded: 0, truncated: false },
       merged: { endpointCount: 2 },
     });
+  });
+
+  // Regression: missing fields were defaulted, producing a plausible-looking
+  // `{host: '', method: 'GET', path: '/'}` operation that could reach the export
+  // payload as something to save.
+  it('discards malformed records rather than inventing operations', async () => {
+    mockApi((url) => {
+      if (url.pathname.endsWith('/discovery/operations')) {
+        return jsonResponse({
+          success: true,
+          result_info: { page: 1, per_page: 100, total_pages: 1 },
+          result: [
+            { id: 'ok', host: 'api.example.com', method: 'GET', endpoint: '/a', state: 'review' },
+            { id: 'no-host', method: 'GET', endpoint: '/b', state: 'review' },
+            { id: 'blank-host', host: '   ', method: 'GET', endpoint: '/c', state: 'review' },
+            { id: 'no-path', host: 'api.example.com', method: 'GET', state: 'review' },
+            { id: 'no-method', host: 'api.example.com', endpoint: '/d', state: 'review' },
+          ],
+        });
+      }
+      return emptyList();
+    });
+
+    const warnings: string[] = [];
+    const endpoints = await new CloudflareApiConnector().fetchEndpoints(
+      baseConfig({ onWarning: (m) => warnings.push(m) }),
+    );
+
+    expect(endpoints).toHaveLength(1);
+    expect(endpoints[0].id).toBe('ok');
+    expect(endpoints.some((e) => e.host === '')).toBe(false);
+    expect(warnings.join(' ')).toMatch(/Discarded 4 malformed discovery record/);
+  });
+
+  it('counts discarded records in the fetch stats', async () => {
+    mockApi((url) => {
+      if (url.pathname.endsWith('/discovery/operations')) {
+        return jsonResponse({
+          success: true,
+          result_info: { page: 1, per_page: 100, total_pages: 1 },
+          result: [{ id: 'bad' }, { id: 'ok', host: 'a.example.com', method: 'GET', endpoint: '/a' }],
+        });
+      }
+      return emptyList();
+    });
+
+    const stats = await new CloudflareApiConnector().fetchEndpointStats(baseConfig());
+    expect(stats.discovery.discarded).toBe(1);
+    expect(stats.discovery.operationCount).toBe(1);
   });
 
   it('defaults the discovery state filter to review,saved,ignored', async () => {
@@ -504,6 +553,59 @@ describe('ShieldOptimizerAgent.run', () => {
   it('defaults to the live API connector when none is supplied', () => {
     expect(new ShieldOptimizerAgent()).toBeInstanceOf(ShieldOptimizerAgent);
     expect(new CloudflareApiConnector()).toBeInstanceOf(CloudflareApiConnector);
+  });
+});
+
+/**
+ * The tool must never write to a customer's zone. This is the property that
+ * guarantees it, so it is asserted across every request the connector makes
+ * rather than trusted to review.
+ */
+describe('read-only invariant', () => {
+  function recordRequests(): Array<{ url: string; method: string }> {
+    const seen: Array<{ url: string; method: string }> = [];
+    global.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const method =
+        init?.method ?? (typeof input === 'object' && 'method' in input ? (input as Request).method : 'GET');
+      seen.push({ url, method: method.toUpperCase() });
+      return jsonResponse({ success: true, result_info: { page: 1, per_page: 100, total_pages: 1 }, result: [] });
+    }) as unknown as typeof fetch;
+    return seen;
+  }
+
+  it('issues only GET requests across the whole fetch surface', async () => {
+    const seen = recordRequests();
+    const connector = new CloudflareApiConnector();
+    const config: ConnectorConfig = {
+      apiToken: 'token',
+      zoneId: ZONE_ID,
+      accountId: ACCOUNT_ID,
+      // Schema enrichment adds request paths of its own, so leave it enabled.
+      useSchemas: true,
+      state: 'review,saved,ignored',
+    };
+
+    await connector.fetchEndpoints(config);
+    await connector.fetchEndpointStats(config);
+    await connector.listZones('token');
+
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((r) => r.method === 'GET')).toBe(true);
+    expect([...new Set(seen.map((r) => r.method))]).toEqual(['GET']);
+  });
+
+  it('never targets a mutating API path', async () => {
+    const seen = recordRequests();
+    const connector = new CloudflareApiConnector();
+    await connector.fetchEndpoints({ apiToken: 'token', zoneId: ZONE_ID, useSchemas: true });
+
+    for (const { url } of seen) {
+      // `.../operations` is read here; the write endpoints are POST/PATCH on the
+      // same paths, which the method assertion above covers.
+      expect(url).toContain('/api_gateway/');
+      expect(url).not.toContain('/purge_cache');
+    }
   });
 });
 

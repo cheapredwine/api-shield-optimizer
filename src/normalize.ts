@@ -228,6 +228,32 @@ function digitRatio(value: string): number {
 }
 
 /**
+ * Coarse shape class of a path segment, used to decide whether a literal
+ * resembles its siblings.
+ *
+ * Members of one identifier family share a shape; a static sub-page sitting in
+ * the same collection usually does not. `/products/8813245` and
+ * `/products/clearance` occupy the same position under the same prefix with the
+ * same continuation, so only the shape of the value separates them.
+ *
+ * Deliberately ignores length. Numeric ids are frequently variable-length
+ * (`/orders/7` alongside `/orders/183024`), and splitting on length would break
+ * exactly the families this is meant to collapse.
+ *
+ * Classes are coarse for the same reason. `electronics` and `home-garden` are
+ * both human-readable text and belong to one `/c/{category}` family, so
+ * separating hyphenated from unhyphenated words would leave that family split.
+ */
+function segmentShape(segment: string): string {
+  if (/^\d+$/.test(segment)) return 'numeric';
+  if (/^[0-9a-f]{8,}$/i.test(segment) && /\d/.test(segment)) return 'hex';
+  // Words, optionally separated — a readable slug either way.
+  if (/^[A-Za-z]+(?:[-_.][A-Za-z]+)*$/.test(segment)) return 'text';
+  if (/^[A-Za-z0-9]+$/.test(segment)) return 'alphanumeric';
+  return 'other';
+}
+
+/**
  * Detects opaque high-cardinality segments without swallowing readable slugs.
  *
  * The previous heuristic matched any 24+ char alphanumeric string with two
@@ -441,7 +467,9 @@ export function inferSiblingVariables(
     contextSegments.set(path, normalizePath(path).pattern.split('/').filter(Boolean));
   }
 
-  const buckets = new Map<string, { literals: Set<string>; paths: string[] }>();
+  // Literals are tracked per shape so a static sub-page cannot be absorbed by an
+  // identifier family that merely shares its position.
+  const buckets = new Map<string, { byShape: Map<string, Set<string>>; alreadyVariable: number }>();
   for (const path of unique) {
     const segments = rawSegments.get(path)!;
     const context = contextSegments.get(path)!;
@@ -457,41 +485,62 @@ export function inferSiblingVariables(
       const key = `${segments.length}\u0000${i}\u0000${prefix}\u0000${suffix}`;
       let bucket = buckets.get(key);
       if (!bucket) {
-        bucket = { literals: new Set<string>(), paths: [] };
+        bucket = { byShape: new Map<string, Set<string>>(), alreadyVariable: 0 };
         buckets.set(key, bucket);
       }
+
       // A sibling a format rule already flagged counts as evidence that this
-      // position holds identifiers, and is in fact the strongest hint
-      // available. Half-recognised families depend on it: without these the
-      // remaining literals can sit below the threshold on their own.
-      bucket.literals.add(pathVarIndex(segment) !== null ? `\u0001var` : segment);
-      bucket.paths.push(path);
+      // position holds identifiers, and is the strongest hint available.
+      // Half-recognised families depend on it: without these the remaining
+      // literals can sit below the threshold on their own.
+      if (pathVarIndex(segment) !== null) {
+        bucket.alreadyVariable++;
+        continue;
+      }
+
+      const shape = segmentShape(segment);
+      let literals = bucket.byShape.get(shape);
+      if (!literals) {
+        literals = new Set<string>();
+        bucket.byShape.set(shape, literals);
+      }
+      literals.add(segment);
     }
   }
 
-  // Stage 1: a position is variable where enough distinct values share an
-  // identical prefix and continuation.
-  const confirmedPrefixPositions = new Set<string>();
+  // Stage 1: a position is variable for a given shape where enough distinct
+  // values of that shape share an identical prefix and continuation.
+  const confirmed = new Set<string>();
   for (const [key, bucket] of buckets) {
-    if (bucket.literals.size < minSiblings) continue;
     const [, position, prefix] = key.split('\u0000');
-    confirmedPrefixPositions.add(`${prefix}\u0000${position}`);
+    for (const [shape, literals] of bucket.byShape) {
+      // Already-variable siblings top up the count, but cannot carry a shape on
+      // their own: a lone static literal beside four recognised ids would
+      // otherwise be absorbed. Two real values of the same shape are the
+      // minimum that establishes a family.
+      const enough =
+        literals.size >= minSiblings ||
+        (literals.size >= 2 && literals.size + bucket.alreadyVariable >= minSiblings);
+      if (enough) confirmed.add(`${prefix}\u0000${position}\u0000${shape}`);
+    }
   }
 
   // Stage 2: propagate to deeper continuations under the same prefix. Requiring
   // an identical continuation in stage 1 is what stops distinct resources from
-  // pooling, but once a position is known to hold identifiers every route below
-  // it inherits that: `/items/{id}` and `/items/{id}/detail` carry the same
-  // identifier. Sub-resources rely on this, since they are often observed with
-  // far fewer values than the collection itself.
+  // pooling, but once a position is known to hold identifiers of a given shape,
+  // every route below it inherits that: `/items/{id}` and `/items/{id}/detail`
+  // carry the same identifier. Sub-resources rely on this, since they are often
+  // observed with far fewer values than the collection itself. The shape still
+  // has to match, so a static sibling is not swept up on prefix alone.
   const inferred = new Map<string, Set<number>>();
   for (const path of unique) {
     const segments = rawSegments.get(path)!;
     const context = contextSegments.get(path)!;
     for (let i = 1; i < segments.length; i++) {
-      if (STATIC_SEGMENT_ALLOWLIST.has(segments[i].toLowerCase())) continue;
+      const segment = segments[i];
+      if (STATIC_SEGMENT_ALLOWLIST.has(segment.toLowerCase())) continue;
       const prefix = context.slice(0, i).join('/');
-      if (!confirmedPrefixPositions.has(`${prefix}\u0000${i}`)) continue;
+      if (!confirmed.has(`${prefix}\u0000${i}\u0000${segmentShape(segment)}`)) continue;
       let positions = inferred.get(path);
       if (!positions) {
         positions = new Set<number>();
@@ -528,17 +577,12 @@ export function groupEndpoints(endpoints: Endpoint[]): NormalizedGroup[] {
     }
   }
 
-  // Every host+path shape, used to expose the full method set per shape.
+  // Cluster first, because the method set has to be scoped to a single host.
+  // Keying it by path alone pools unrelated hosts, so `GET api.acme.com/orders`
+  // and `POST blog.other.com/orders` would each be credited with a REST method
+  // set neither of them has.
+  const pending: Array<{ method: string; pathPattern: string; hostPattern: string; members: Endpoint[] }> = [];
   const methodsByShape = new Map<string, Set<string>>();
-  for (const [method, byPath] of byMethod) {
-    for (const pathPattern of byPath.keys()) {
-      const set = methodsByShape.get(pathPattern) ?? new Set<string>();
-      set.add(method);
-      methodsByShape.set(pathPattern, set);
-    }
-  }
-
-  const results: NormalizedGroup[] = [];
 
   const methods = [...byMethod.keys()].sort();
   for (const method of methods) {
@@ -546,27 +590,33 @@ export function groupEndpoints(endpoints: Endpoint[]): NormalizedGroup[] {
     const paths = [...byPath.keys()].sort();
 
     for (const pathPattern of paths) {
-      const members = byPath.get(pathPattern)!;
-      const clusters = clusterByHost(members);
+      for (const cluster of clusterByHost(byPath.get(pathPattern)!)) {
+        pending.push({ method, pathPattern, hostPattern: cluster.hostPattern, members: cluster.members });
 
-      for (const cluster of clusters) {
-        results.push({
-          groupId: '',
-          normalizedHostPattern: cluster.hostPattern,
-          normalizedPathPattern: pathPattern,
-          method,
-          methodsOnPath: [...(methodsByShape.get(pathPattern) ?? new Set([method]))].sort(),
-          members: cluster.members,
-          recommendedAction: 'manual_review',
-          confidence: 0.5,
-          score: emptyScore(),
-          signals: [],
-          reasoning: [],
-          flags: [],
-        });
+        const shape = `${cluster.hostPattern}\u0000${pathPattern}`;
+        const set = methodsByShape.get(shape) ?? new Set<string>();
+        set.add(method);
+        methodsByShape.set(shape, set);
       }
     }
   }
+
+  const results: NormalizedGroup[] = pending.map(({ method, pathPattern, hostPattern, members }) => ({
+    groupId: '',
+    normalizedHostPattern: hostPattern,
+    normalizedPathPattern: pathPattern,
+    method,
+    methodsOnPath: [
+      ...(methodsByShape.get(`${hostPattern}\u0000${pathPattern}`) ?? new Set([method])),
+    ].sort(),
+    members,
+    recommendedAction: 'manual_review' as const,
+    confidence: 0.5,
+    score: emptyScore(),
+    signals: [],
+    reasoning: [],
+    flags: [],
+  }));
 
   // Stable IDs assigned after deterministic ordering.
   return results.map((group, idx) => ({
