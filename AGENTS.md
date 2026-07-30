@@ -2,6 +2,56 @@
 
 CLI-only tool. There is no Worker, no server and no deployment step.
 
+## The live API is the only data source
+
+There is no file-based input path and no snapshot mode. Do not add one: a
+hand-authored fixture can supply fields the discovery API never returns, and
+scoring against them yields conclusions that cannot hold on a real zone. Drive
+the engine from `engine.test.ts`, which builds `Endpoint` objects with `makeEp`
+and calls the pure functions directly.
+
+An **unlabelled** HTML page therefore carries no negative api signal.
+`cf-web-page` is what rejects the labelled case; for the unlabelled case, rule 4
+of the decision ladder is the only thing standing between a rendered form and a
+wasted operation slot. If managed labels prove frequently absent, this is the gap
+to revisit first.
+
+## Behaviour worth preserving
+
+- A self-sufficient invocation is never interrupted by config scaffolding.
+  `optionsAreSelfSufficient()` in `cli.ts` gates it.
+- `--zone-id` is validated **before** the token is resolved, so a malformed zone
+  id is reported as such rather than as a missing token.
+- File errors name the file and the cause; no raw `ENOENT`.
+
+## Known bugs, unfixed
+
+- **Sibling propagation over-merges.** Stage 2 of `inferSiblingVariables` drops
+  the identical-continuation requirement and matches on prefix+position alone, so
+  `/products/clearance` and `/products/gift-guide` are absorbed into
+  `/products/{var1}`. Three operations become one; two vanish and their traffic
+  is misattributed. Only `STATIC_SEGMENT_ALLOWLIST` guards it. Fix: require the
+  continuation to match, or require the absorbed literal to resemble its
+  siblings. This is the "worst failure direction" this file warns about.
+- **`connectors/api.ts` `mergeEndpoints` coerces unknown traffic to zero** —
+  `hits: (existing.hits ?? 0) + (ep.hits ?? 0)`. In API mode `hits` is always
+  null, so every deduplicated shape becomes `0`, which then reads as measured.
+  Must yield `null` when both are null.
+- `rankValue` can rank `manual_review` above `save`: the traffic term spans
+  ~1.125 but the action term only 1.0.
+- Budget is computed *after* `maxGroups` truncation, so the report claims free
+  slots that do not exist.
+- `minHits` is a silent no-op in API mode — it inspects only `hits`. Use
+  `requestsPerHour()`.
+- `methodsByShape` is keyed by path only despite a comment saying host+path, so
+  `rest-method-set` is awarded across unrelated hosts.
+- Malformed API records are defaulted into plausible operations
+  (`{host:"",method:"GET",path:"/"}`) and can reach the export payload.
+- `scoring` overrides from the config file are unvalidated: `apiFloor: -1` turns
+  a privacy policy into a `save`. `rulesetVersion` is user-overridable.
+- `buildApplyPayload` and `formatBundleAsText` have no tests at all, and nothing
+  asserts the GET-only invariant.
+
 **Hard rule: this tool must never write to the Cloudflare API.** Connectors issue
 `GET` only. `src/export.ts` builds request payloads as data and performs no
 network I/O. Do not add a command that applies changes.
@@ -25,7 +75,6 @@ repo:
 
 ```json
 {
-  "mode": "api",
   "tokenFile": "/absolute/path/to/cf_api_token",
   "zoneId": "",
   "accountId": "",
@@ -55,12 +104,9 @@ secret (visible in argv and shell history), and do not reintroduce an inline
 Config resolution order: `--config <path>` → `./optimizer.config.json` →
 `$XDG_CONFIG_HOME/api-shield-optimizer/config.json`.
 
-For iteration without hitting the API, use snapshot mode — only `host`, `method`
-and `path` are required per entry:
-
-```bash
-npx tsx src/cli.ts propose --mode snapshot --snapshot fixture.json --format text --output -
-```
+To iterate on the engine without hitting the API, drive it from a test —
+`engine.test.ts` builds `Endpoint` objects with `makeEp` and calls the pure
+functions directly. There is no file-based input path, by design.
 
 ## Code style
 - Strict TypeScript (`strict: true`)
@@ -70,7 +116,7 @@ npx tsx src/cli.ts propose --mode snapshot --snapshot fixture.json --format text
 
 ## Project structure
 - `src/validate.ts` — ID/state/integer validation shared by CLI and connectors
-- `src/connectors/` — Cloudflare API and snapshot connectors, plus `createConnector`
+- `src/connectors/` — the Cloudflare API connector, plus `createConnector`
 - `src/normalize.ts` — path + host normalization, grouping
 - `src/scoring-config.ts` — all tunable weights, patterns, thresholds, `rulesetVersion`
 - `src/classify.ts` — two-axis scoring and confidence
@@ -84,15 +130,17 @@ npx tsx src/cli.ts propose --mode snapshot --snapshot fixture.json --format text
 - `src/cli.ts` — CLI entry point
 
 ## Command surface
-`propose`, `review`, `export-payload`, `zones`, `smoke-fetch`, `snapshot-guide`.
+`propose`, `review`, `export-payload`, `zones`, `smoke-fetch`.
 
 Intended sequence: `propose` → `review` → `export-payload`.
 
-## Adding a new connector
-1. Implement the `DataConnector` interface in `src/connectors/`
-2. Add the case to `createConnector` in `src/connectors/index.ts`
-3. Add the mode to `ConnectorConfig['mode']` in `src/types.ts`
-4. Read-only. `GET` requests only.
+## The connector
+
+`src/connectors/api.ts` is the only implementation of `DataConnector`, and the
+interface exists as the injection seam for `ShieldOptimizerAgent`, whose
+constructor takes a connector so `run()` can be tested without HTTP. There is no
+factory: a caller never chooses between implementations. Any connector is
+read-only, `GET` only.
 
 ## Extending classification
 
@@ -104,9 +152,9 @@ Edit `src/scoring-config.ts`, not `classify.ts`, for anything tunable:
   `GET /zones/{zone}/api_gateway/labels`; every managed entry has
   `source: "managed"`. A label may appear on both axes.
 - `pathRules` / `sensitivityRules` — regex rules with weights
-- Anchor every pattern to whole segments, i.e. `(?:^|/)word(?:/|$)`. Unanchored
-  substrings caused the original false positives: `/priv` matched
-  `privacy-policy`, `/user` matched `user-guide`.
+- Anchor every pattern to whole segments, i.e. `(?:^|/)word(?:/|$)`. An
+  unanchored substring matches inside a word: `/priv` hits `privacy-policy`,
+  `/user` hits `user-guide`.
 - Bump `rulesetVersion` when weights or thresholds change. It is embedded in
   every bundle and decision file, and `review` warns on a mismatch.
 
@@ -117,26 +165,49 @@ wins:
 1. sensitive but not API-shaped → `manual_review`
 2. `api < apiFloor` (0.4) → `ignore`
 3. `cf-risk-zombie` → `manual_review`
-4. `api >= apiCertain` (0.8) → `save`
-5. `combined >= saveThreshold` (0.62) → `save`
-6. `combined <= ignoreThreshold` (0.38) → `ignore`
-7. otherwise → `manual_review`
+4. no discriminating api evidence → `manual_review`
+5. `api >= apiCertain` (0.8) → `save`
+6. `combined >= saveThreshold` (0.62) → `save`
+7. `combined <= ignoreThreshold` (0.38) → `ignore`
+8. otherwise → `manual_review`
 
 Rule 1 exists because rule 2 is a hard short-circuit that never weighs
 sensitivity. An unlabelled `POST /checkout/session/{id}` scores `api` 0.35
-against a 0.40 floor, so it was ignored despite a financial signal — the worst
-failure direction for a security tool.
+against a 0.40 floor, so without rule 1 it is ignored despite a financial
+signal — the worst failure direction for a security tool.
 
 **Do not trigger rule 1 on sensitivity alone.** It is gated on
 `sensitivityRescueApiFloor` (0.3), because a managed `cf-web-page` label pulls
 `api` to ~0.21 and those pages score *higher* on sensitivity (1.00) than the
 endpoints worth rescuing (0.50). Gating on sensitivity alone floods manual review
-with marketing pages — measured at 127 of them on a 3,000-operation fixture.
+with marketing pages.
 
-Rule 3 must stay ahead of rule 4: a zombie is definitionally an API, so
+Rule 3 must stay ahead of rule 5: a zombie is definitionally an API, so
 `apiCertain` would auto-save it, but it is *already* saved and the real question
-is whether to reclaim the slot. Mirror any change to rules 1 and 3 in
+is whether to reclaim the slot. Mirror any change to rules 1, 3 and 4 in
 `redecide()`, which re-runs the whole decision after sibling propagation.
+
+**Rule 4 is what stops a rendered page being saved when no label is present.**
+Most of the api axis does not discriminate: an HTML form is submitted with
+`POST`, sits on an authentication path, and serves `GET` and `POST` on one URL
+(render, then submit), so `write-method`, `auth-path-implies-api` and
+`rest-method-set` are all equally true of a page. An unlabelled
+`POST /users/login` therefore reaches api 0.62 / combined 0.74 and clears the
+save threshold on evidence that proves nothing. Rule 4 requires at least one
+signal from `discriminatingApiSignals` — a schema, an api label, an `/api` or
+version segment, GraphQL/gRPC, a path variable, observed auth identifiers, an API
+hostname, or propagated parent evidence.
+
+It escalates rather than ignoring: absent evidence is not evidence of absence,
+and silently dropping a real API is the worse failure. Do not "fix" a
+`no-api-evidence` case by adding a non-discriminating signal to the list; that
+reopens the false positive.
+
+`apiHostPatterns` matches the **host**, not the path — a hostname dedicated to an
+API is one of the few discriminators the discovery API supplies for free. It is
+suppressed when `cf-web-page` is present, because Cloudflare inspected the
+response and a name is only an inference; letting it apply would erode the margin
+that keeps labelled pages out of manual review.
 
 `confidence` is evidence strength, computed independently of the score. Do not
 make it a restatement of the score.
@@ -154,28 +225,25 @@ Edit `src/normalize.ts`:
   literal: a position is variable when enough distinct values share a prefix,
   depth and identical continuation. That is also the only thing that can catch
   word-based ids (`/c/{category}`, `/p/{slug}`), which are indistinguishable
-  from static resource names in isolation. It removed the need for a
-  format-specific rule entirely — 2,998 overlapping operations collapsed from
-  493 groups to 32.
+  from static resource names in isolation.
 - Already-variable siblings **count as evidence**, and a confirmed position
-  propagates to deeper continuations (`/x/{id}` ⇒ `/x/{id}/sub`). Both were
-  bugs: without them an id family stayed split exactly when half of it had been
-  recognised, and sub-resources with few observed values never collapsed.
+  propagates to deeper continuations (`/x/{id}` ⇒ `/x/{id}/sub`). Without the
+  first, an id family stays split exactly when half of it has been recognised;
+  without the second, sub-resources with few observed values never collapse.
 - Add action verbs to `STATIC_SEGMENT_ALLOWLIST`, not just resource nouns. An
   action shares its collection's prefix, so `/products/search` pools with
   `/products/{sku}` and gets absorbed into the identifier position, hiding an
   operation and misattributing its traffic. Erring toward literal is safe: a
   missing entry merges two operations, a spurious one only splits a group.
-- Keep domain-specific formats out. A VIN rule was added and then removed once
-  sibling inference subsumed it; customer-specific identifier shapes do not
-  belong in a general normalizer.
+- Keep domain-specific formats out. Sibling inference already collapses
+  customer-specific identifier shapes, and they do not belong in a general
+  normalizer.
 - Keep `isHighCardinalitySegment()` conservative. Regressions to watch:
   `iphone13promax`, `top10bestlaptops`, `office365business`, `html5videoplayer`,
   `error404handler` must all stay literal.
 - Cloudflare's placeholders (`{varN}`, `{hostVarN}`) are tokens, not names. Route
-  every hostname through `canonicalizeHost()` rather than calling
-  `toLowerCase()`, which produced `{hostvar1}` in every report. New variables
-  must continue Cloudflare's numbering.
+  every hostname through `canonicalizeHost()`; a plain `toLowerCase()` yields
+  `{hostvar1}`. New variables must continue Cloudflare's numbering.
 - Hostname variables must cover a **complete label** and must never touch the
   registrable domain (eTLD+1). Add new multi-label suffixes to
   `MULTI_LABEL_SUFFIXES`.
@@ -186,19 +254,19 @@ Edit `src/normalize.ts`:
 Always go through `src/prompt.ts`. Never call `rl.question` directly: with
 `terminal: false` readline drops lines buffered before the call, and a closed
 stream leaves the callback unfired, so the process hangs or exits silently having
-done nothing. Both bugs shipped once — in `review` (losing every decision on
-piped input) and in the zone picker. `LineReader` queues lines and returns `null`
-at end of input; handle that case explicitly.
+done nothing — which loses every decision in `review` on piped input.
+`LineReader` queues lines and returns `null` at end of input; handle that case
+explicitly.
 
-## API mode vs snapshot mode signals
+## Response metadata is not available
 
 `contentTypes`, `statusCodes`, `cacheHitRatio` and `inSitemap` are **not returned
-by the discovery API**. They are snapshot-mode enrichment only. Do not assume
-they are present when reasoning about classification, and do not validate a
-scoring change solely against a snapshot fixture that supplies them — that
-mistake hid a false positive where an HTML login form scored `api=0.74`.
+by the discovery API**, so no signal may depend on them. Do not reintroduce a
+field on `Endpoint` that the connector cannot populate, and do not validate a
+scoring change against a hand-written fixture that supplies one: that is how an
+HTML login form comes to score `api=0.74`.
 
-In API mode the equivalent signal comes from managed labels.
+Telling a rendered page from an API surface is the managed labels' job.
 
 ## Already-decided operations
 
@@ -225,7 +293,7 @@ was observed longest.
 Consequences worth remembering:
 - `rankValue()` in `src/agent.ts` falls back to the rate. Without that fallback
   every live endpoint contributes zero and budget ranking degenerates to path
-  order — a `--operation-budget 2` run picked 5 req/hr over 900 req/hr.
+  order, so `--operation-budget 2` can pick 5 req/hr over 900 req/hr.
 - `hasTrafficData` must consider the rate, or every live endpoint is flagged
   `no-traffic-data` and reports read `Total Hits: 0`.
 - `highTrafficRatePerHour` / `lowTrafficRatePerHour` are **absolute** thresholds
@@ -240,7 +308,7 @@ Consequences worth remembering:
 
 ## Testing
 - `src/__tests__/engine.test.ts` — normalization, scoring, proposals
-- `src/__tests__/connectors.test.ts` — API pagination/validation, snapshot parsing
+- `src/__tests__/connectors.test.ts` — API pagination, validation, field mapping
 - `src/__tests__/review.test.ts` — interactive loop (drive it with `Readable.from`)
 - `src/__tests__/prompt.test.ts` — line buffering and end-of-input behaviour
 - `src/__tests__/config.test.ts` — config mutation, permission and failure modes
@@ -248,18 +316,12 @@ Consequences worth remembering:
 - When fixing a classification bug, add the offending path as a named regression
   case
 
-### Where coverage has been thin
+### Assert the shape of the output, not only the scores
 
-Two bugs survived because **no test asserted the shape of the output**, only the
-scores:
-
-- The CSV column headed `flags` carried signal ids, so triage flags never reached
-  the spreadsheet an operator signs off on.
-- `includeDecided` had no test at all, which is why flipping its default broke
-  nothing.
-
-Prefer a test that asserts what an operator actually sees over one that asserts an
-internal number.
+A score assertion cannot catch a report that is wired up wrong: a CSV column
+headed `flags` can carry signal ids, or a default like `includeDecided` can flip
+with no test noticing. Prefer a test that asserts what an operator actually sees
+over one that asserts an internal number.
 
 ## Open questions and future work
 
@@ -267,13 +329,12 @@ Ordered roughly by risk. Nothing here is blocking, but each is a known weakness
 rather than a speculative nicety.
 
 ### Validate against real high-cardinality data
-Every collapse figure quoted in this file (493 → 32 groups) comes from a
-hand-authored fixture, so it partly encodes the author's assumptions about what
-the traffic looks like. `MIN_SIBLINGS_FOR_VARIABLE = 4` and the stage-2 prefix
-propagation are the two riskiest knobs: propagation could over-merge a genuine
-sub-resource that is missing from `STATIC_SEGMENT_ALLOWLIST`. A sanitized path
-list from a zone with thousands of overlapping operations would settle it. Until
-then, treat the numbers as indicative.
+Sibling inference has only ever been exercised against synthetic paths, which
+encode assumptions about what real traffic looks like.
+`MIN_SIBLINGS_FOR_VARIABLE = 4` and the stage-2 prefix propagation are the two
+riskiest knobs: propagation can over-merge a genuine sub-resource that is missing
+from `STATIC_SEGMENT_ALLOWLIST`. A sanitized path list from a zone with thousands
+of overlapping operations would settle it.
 
 ### Percentile-relative traffic thresholds
 `highTrafficRatePerHour` / `lowTrafficRatePerHour` are absolute, so on a very

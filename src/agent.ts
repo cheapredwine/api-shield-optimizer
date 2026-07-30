@@ -6,7 +6,7 @@ import type {
   NormalizedGroup,
   ProposalBundle,
 } from './types.js';
-import { createConnector } from './connectors/index.js';
+import { CloudflareApiConnector } from './connectors/index.js';
 import { groupEndpoints } from './normalize.js';
 import { applySiblingPropagation, classifyGroup, totalKnownHits, totalRequestsPerHour } from './classify.js';
 import { generateBundle, type BundleContext } from './proposal.js';
@@ -32,14 +32,13 @@ export interface AgentOptions {
 
 export class ShieldOptimizerAgent {
   /**
-   * The factory is injectable so tests can supply a stub connector. Normal
-   * callers omit it and get the standard api/snapshot factory.
+   * The connector is injectable so tests can drive `run()` without HTTP. There
+   * is exactly one production implementation.
    */
-  constructor(private readonly connectorFactory: (config: ConnectorConfig) => DataConnector = createConnector) {}
+  constructor(private readonly connector: DataConnector = new CloudflareApiConnector()) {}
 
   async run(options: AgentOptions): Promise<ProposalBundle> {
-    const connector = this.connectorFactory(options.connectorConfig);
-    const endpoints = await connector.fetchEndpoints(options.connectorConfig);
+    const endpoints = await this.connector.fetchEndpoints(options.connectorConfig);
     return this.analyze(endpoints, options);
   }
 

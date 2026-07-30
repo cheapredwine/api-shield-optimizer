@@ -18,7 +18,6 @@ function makeEp(overrides: Partial<Endpoint> = {}): Endpoint {
     hits: 1000,
     lastSeenAt: new Date().toISOString(),
     rawReference: {},
-    contentTypes: ['application/json'],
     ...overrides,
   };
 }

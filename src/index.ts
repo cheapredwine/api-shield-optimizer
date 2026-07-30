@@ -1,6 +1,6 @@
 export * from './types.js';
 export { ShieldOptimizerAgent, rankValue } from './agent.js';
-export { createConnector, CloudflareApiConnector, SnapshotConnector } from './connectors/index.js';
+export { CloudflareApiConnector } from './connectors/index.js';
 export {
   groupEndpoints,
   normalizePath,
@@ -11,8 +11,17 @@ export {
   canonicalizeHost,
   pathVarIndex,
   hostVarIndex,
+  inferSiblingVariables,
+  MIN_SIBLINGS_FOR_VARIABLE,
 } from './normalize.js';
-export { classifyGroup, applySiblingPropagation, totalKnownHits } from './classify.js';
+export {
+  classifyGroup,
+  applySiblingPropagation,
+  totalKnownHits,
+  requestsPerHour,
+  totalRequestsPerHour,
+  formatRate,
+} from './classify.js';
 export {
   DEFAULT_SCORING_CONFIG,
   compileScoringConfig,

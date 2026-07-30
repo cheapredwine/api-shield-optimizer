@@ -3,7 +3,7 @@ import { Command } from 'commander';
 import { askOnce } from './prompt.js';
 import { saveZoneIdToConfig } from './config.js';
 import { ShieldOptimizerAgent } from './agent.js';
-import { CloudflareApiConnector, createConnector } from './connectors/index.js';
+import { CloudflareApiConnector } from './connectors/index.js';
 import { formatBundleAsText } from './format.js';
 import { buildApplyPayload, bundleToCsv } from './export.js';
 import { runInteractiveReview } from './review.js';
@@ -12,7 +12,6 @@ import type { ScoringConfig } from './scoring-config.js';
 import { ValidationError, assertCloudflareId, parseBoundedInt, parseDiscoveryStates } from './validate.js';
 
 interface ConfigFile {
-  mode?: string;
   tokenFile?: string;
   zoneId?: string;
   accountId?: string;
@@ -21,7 +20,6 @@ interface ConfigFile {
   operationBudget?: number;
   maxMembers?: number;
   output?: string;
-  snapshot?: string;
   state?: string;
   useSchemas?: boolean;
   excludeDecided?: boolean;
@@ -31,7 +29,6 @@ interface ConfigFile {
 const DEFAULT_CONFIG_FILENAME = 'optimizer.config.json';
 
 const DEFAULT_CONFIG: ConfigFile = {
-  mode: 'api',
   tokenFile: '',
   zoneId: '',
   accountId: '',
@@ -97,11 +94,23 @@ async function resolveConfigPath(explicit?: string): Promise<{ path: string; exi
   return { path: candidates[0], existed: false };
 }
 
+/**
+ * True when the command line alone carries everything needed to run, so no
+ * config file has to exist.
+ *
+ * A run needs a zone plus a token, and the token legitimately arrives from the
+ * environment rather than from any flag.
+ */
+function optionsAreSelfSufficient(opts: { zoneId?: string; tokenFile?: string }): boolean {
+  const hasToken = Boolean(opts.tokenFile ?? process.env.CF_API_TOKEN);
+  return Boolean(opts.zoneId) && hasToken;
+}
+
 /** Loads config, creating a template on first run. Returns the resolved path so
  *  callers can persist choices back to it. */
 async function loadConfigOrScaffold(
   explicit?: string,
-  opts: { requireExisting?: boolean } = {},
+  opts: { requireExisting?: boolean; alreadySufficient?: boolean } = {},
 ): Promise<{ config: ConfigFile; path?: string }> {
   const resolved = await resolveConfigPath(explicit);
 
@@ -110,6 +119,13 @@ async function loadConfigOrScaffold(
   }
 
   if (opts.requireExisting) {
+    return { config: {} };
+  }
+
+  // The config file exists to spare the user from repeating connection details,
+  // so demanding one when the command line already carries everything is pure
+  // friction.
+  if (opts.alreadySufficient) {
     return { config: {} };
   }
 
@@ -289,36 +305,38 @@ interface SharedOpts {
 }
 
 async function buildConnectorConfig(
-  opts: SharedOpts & { mode?: string; snapshot?: string; state?: string; schemas?: boolean },
+  opts: SharedOpts & { state?: string; schemas?: boolean },
   fileConfig: ConfigFile,
   requireZone = true,
   configPath?: string,
 ): Promise<ConnectorConfig> {
-  const mode = (opts.mode ?? fileConfig.mode ?? 'snapshot') as ConnectorConfig['mode'];
+  // Check anything the user typed before checking what they may not have set up
+  // yet. A malformed --zone-id otherwise surfaces as "API token required",
+  // which points at the wrong argument entirely.
+  const suppliedZoneId = opts.zoneId ?? fileConfig.zoneId ?? undefined;
+  if (suppliedZoneId) {
+    assertCloudflareId(suppliedZoneId, 'zoneId');
+  }
 
   const apiToken = await resolveToken({
     tokenFile: opts.tokenFile ?? fileConfig.tokenFile ?? undefined,
   });
 
-  if (mode === 'api' && !apiToken) {
+  if (!apiToken) {
     fail('API token required. Set CF_API_TOKEN, use --token-file, or set tokenFile in the config.');
   }
 
-  let zoneId = opts.zoneId ?? fileConfig.zoneId ?? undefined;
-  if (mode === 'api' && apiToken && requireZone && (!zoneId || zoneId === '')) {
+  let zoneId = suppliedZoneId;
+  if (apiToken && requireZone && (!zoneId || zoneId === '')) {
     zoneId = await selectZoneInteractively(apiToken, configPath);
   }
 
-  if (mode === 'api') {
-    zoneId = assertCloudflareId(zoneId, 'zoneId');
-  }
+  zoneId = assertCloudflareId(zoneId, 'zoneId');
 
   return {
-    mode,
     apiToken,
     accountId: opts.accountId ?? fileConfig.accountId ?? undefined,
     zoneId,
-    snapshotPath: opts.snapshot ?? fileConfig.snapshot ?? undefined,
     state: parseDiscoveryStates(opts.state ?? fileConfig.state ?? undefined).join(','),
     useSchemas: opts.schemas === false ? false : (fileConfig.useSchemas ?? true),
   };
@@ -337,11 +355,9 @@ program
   .command('propose')
   .description('Generate a proposal bundle from discovered endpoints')
   .option('--config <path>', 'Path to JSON config file')
-  .option('--mode <mode>', 'connector mode: api, snapshot')
   .option('--token-file <path>', 'Path to a file containing the API token')
   .option('--account-id <id>', 'Cloudflare account ID')
   .option('--zone-id <id>', 'Cloudflare zone ID')
-  .option('--snapshot <path>', 'Path to snapshot JSON file')
   .option('--state <states>', 'Discovery states to include: review,saved,ignored')
   .option('--no-schemas', 'Skip uploaded API schema enrichment')
   .option(
@@ -358,7 +374,9 @@ program
   .option('--verbose', 'Include full signal breakdown in the text report')
   .option('--output <path>', 'Write to this path. Use "-" for stdout.')
   .action(async (opts) => {
-    const { config: fileConfig, path: configPath } = await loadConfigOrScaffold(opts.config);
+    const { config: fileConfig, path: configPath } = await loadConfigOrScaffold(opts.config, {
+      alreadySufficient: optionsAreSelfSufficient(opts),
+    });
     const config = await buildConnectorConfig(opts, fileConfig, true, configPath);
 
     const agent = new ShieldOptimizerAgent();
@@ -517,7 +535,7 @@ program
 
     if (payload.zoneId === '{zoneId}') {
       console.error('');
-      console.error('Note: the bundle carries no zone ID (typical for snapshot mode).');
+      console.error('Note: the bundle carries no zone ID.');
       console.error('Replace the {zoneId} placeholder in the request URLs before applying.');
     }
 
@@ -570,8 +588,10 @@ program
   .option('--state <states>', 'Discovery states to include: review,saved,ignored')
   .option('--no-schemas', 'Skip uploaded API schema enrichment')
   .action(async (opts) => {
-    const { config: fileConfig, path: configPath } = await loadConfigOrScaffold(opts.config);
-    const config = await buildConnectorConfig({ ...opts, mode: 'api' }, fileConfig, true, configPath);
+    const { config: fileConfig, path: configPath } = await loadConfigOrScaffold(opts.config, {
+      alreadySufficient: optionsAreSelfSufficient(opts),
+    });
+    const config = await buildConnectorConfig(opts, fileConfig, true, configPath);
 
     const connector = new CloudflareApiConnector();
     const stats = await connector.fetchEndpointStats(config);
@@ -582,49 +602,6 @@ program
     if (stats.schemas) {
       console.log(`Uploaded schemas:     ${stats.schemas.schemaCount} (operations: ${stats.schemas.operationCount})`);
     }
-  });
-
-// -------------------------------------------------------------- snapshot-guide
-
-program
-  .command('snapshot-guide')
-  .description('Print the expected snapshot JSON format')
-  .action(() => {
-    console.log(`Snapshot must be JSON containing either an array of Endpoint objects
-or an object with an "endpoints" key.
-
-[
-  {
-    "id": "ep-1",
-    "accountId": "",
-    "zoneId": "",
-    "host": "api.example.com",
-    "method": "GET",
-    "path": "/users/123",
-    "source": "machinelearning",
-    "hits": 5000,
-    "lastSeenAt": "2026-07-28T00:00:00Z",
-    "rawReference": {},
-
-    // Optional enrichment. Each field materially improves classification.
-    "status": "candidate",
-    "inSchema": true,
-    "contentTypes": ["application/json"],
-    "statusCodes": { "200": 4800, "401": 200 },
-    "cacheHitRatio": 0.02,
-    "inSitemap": false,
-    "features": { "authIdTokens": 42, "dataPoints": 5000 }
-  }
-]
-
-Notes:
-  - "hits" may be null to mean "traffic volume unknown". Omit it rather than
-    using 0 when no data is available.
-  - "contentTypes" is the strongest single signal for distinguishing an API
-    from a rendered web page.
-  - "inSchema" marks operations present in an uploaded OpenAPI schema and is
-    the highest-precision signal available.
-`);
   });
 
 async function main(): Promise<void> {

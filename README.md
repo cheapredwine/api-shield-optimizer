@@ -58,7 +58,6 @@ The first run writes `optimizer.config.json`:
 
 ```json
 {
-  "mode": "api",
   "tokenFile": "/absolute/path/to/cf_api_token",
   "zoneId": "",
   "accountId": "",
@@ -158,9 +157,7 @@ Fetches discovery data, groups, scores and writes a bundle.
 
 | Flag | Purpose |
 |---|---|
-| `--mode <api\|snapshot>` | Data source. |
 | `--zone-id`, `--account-id` | Cloudflare IDs (32 hex chars). |
-| `--snapshot <path>` | Snapshot file for `--mode snapshot`. |
 | `--state <states>` | Discovery states to read: `review,saved,ignored`. |
 | `--no-schemas` | Skip uploaded OpenAPI schema enrichment. |
 | `--exclude-decided` | Analyse only undecided operations. By default every operation is reported, including those already saved or ignored. |
@@ -213,7 +210,6 @@ Nothing is transmitted. Review the payload, then apply it yourself.
 ```bash
 npx tsx src/cli.ts zones           # list accessible zones
 npx tsx src/cli.ts smoke-fetch     # fetch operations, print pagination stats
-npx tsx src/cli.ts snapshot-guide  # print the snapshot JSON format
 ```
 
 ---
@@ -257,7 +253,10 @@ Evaluated in order; the first match wins.
 
 | Condition | Result |
 |---|---|
+| sensitive but below the `api` floor | `manual_review` — too consequential to drop unreviewed |
 | `api < 0.4` | `ignore` — below the floor, not an API surface |
+| `cf-risk-zombie` | `manual_review` — already saved, review the slot |
+| no discriminating `api` evidence | `manual_review` — cannot tell a page from an API |
 | `api >= 0.8` | `save` — conclusively an API |
 | `combined >= 0.62` | `save` |
 | `combined <= 0.38` | `ignore` |
@@ -266,6 +265,16 @@ Evaluated in order; the first match wins.
 Splitting the axes matters: a marketing page at `/blog/generate-more-leads` can
 mention a keyword, but it never clears the `api` floor, so it can never be
 saved on that basis alone.
+
+The fourth rule is what separates a rendered form from an endpoint when no label
+is available. An HTML form is submitted with `POST`, lives on an auth path, and
+serves `GET` and `POST` on the same URL, so none of that evidence distinguishes
+it from an API. An operation is only saved automatically if something actually
+discriminating backs it — an uploaded schema, an `api` label, an `/api` or version
+segment, GraphQL/gRPC, a path variable, observed auth identifiers, an API
+hostname, or a confirmed API parent path. Otherwise it goes to a human rather
+than being dropped, because a missing signal is not proof that an endpoint is a
+page.
 
 **`confidence` is separate from the score.** It measures how much evidence backs
 the decision — traffic volume, member count, feature data, schema membership,
@@ -308,17 +317,15 @@ exactly the distinction the two axes exist to make.
 | Signal | Axis | Note |
 |---|---|---|
 | Present in an uploaded OpenAPI schema | api | highest-precision non-label signal |
-| Response content type | api | `application/json` vs `text/html`; **snapshot mode only** |
 | `/api` or version segment | api | anchored to whole segments |
+| API hostname | api | matched on the host, e.g. `api.`, `graphql.`, `*-api.`; suppressed by `cf-web-page` |
 | GraphQL / gRPC endpoint | both | one path fronting an entire API |
 | Auth tokens observed | both | from API Shield feature data |
 | Write method | both | `POST`/`PUT`/`PATCH`/`DELETE` |
-| High cache-hit ratio | api (negative) | cacheable implies static; snapshot mode only |
-| Present in sitemap | api (negative) | crawlable implies a page; snapshot mode only |
 
-Content type, cache ratio, status codes and sitemap membership are **not returned
-by the discovery API**. They only apply when you supply them via snapshot mode.
-In API mode the managed labels do this work instead.
+Response metadata — content type, status codes, cache-hit ratio, sitemap
+membership — is **not returned by the discovery API**, so nothing here depends on
+it. Telling a rendered page from an API surface is the managed labels' job.
 
 All weights, patterns and thresholds live in `src/scoring-config.ts` and can be
 overridden per-run via a `scoring` key in the config file. The active
@@ -327,39 +334,17 @@ to the rules that produced it.
 
 ---
 
-## Snapshot mode
+## Traffic data
 
-Analyse a saved JSON file instead of calling the API — useful for testing,
-sharing a case, or working from an export.
+The discovery API reports traffic only as a **rate** —
+`features.traffic_stats.requests` over `period_seconds` — never as an absolute
+count, so `Endpoint.hits` is always `null` and every comparison uses requests per
+hour. A rate is the better basis anyway: an absolute total mostly favours whichever
+endpoint has been observed longest.
 
-Only `host`, `method` and `path` are required:
-
-```json
-[
-  { "host": "api.example.com", "method": "GET", "path": "/api/v1/orders/8812" },
-  { "host": "api.example.com", "method": "POST", "path": "/api/v1/orders" }
-]
-```
-
-Everything else is optional enrichment, and each field materially improves
-classification:
-
-| Field | Effect |
-|---|---|
-| `contentTypes` | strongest single API-vs-page signal |
-| `inSchema` | highest-precision signal available |
-| `hits` | traffic weighting; `null`/omitted means **unknown**, not zero |
-| `statusCodes` | `401`/`403` presence implies access control |
-| `cacheHitRatio` | high ratio implies static content |
-| `inSitemap` | implies a crawlable page |
-| `features` | API Shield auth-token and threshold data |
-| `status` | `saved`/`ignored` marks an existing decision |
-
-`hits: null` is meaningful and distinct from `0`. Managed operations carry no
-traffic data, and treating that as zero traffic would penalise exactly the
-endpoints already known to matter.
-
-Validation errors name the entry index and the offending field.
+`null` means unknown, not zero. Managed operations carry no traffic data at all,
+and scoring that as zero traffic would penalise exactly the endpoints already
+known to matter.
 
 ---
 

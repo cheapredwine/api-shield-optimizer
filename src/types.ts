@@ -54,14 +54,6 @@ export interface Endpoint {
   /** True when the operation appears in a customer-uploaded API schema. */
   inSchema?: boolean;
   features?: EndpointFeatures;
-  /** Observed response content types, lowercased (e.g. `application/json`). */
-  contentTypes?: string[];
-  /** Observed response status code counts keyed by code. */
-  statusCodes?: Record<string, number>;
-  /** Fraction of responses served from cache, 0..1. */
-  cacheHitRatio?: number;
-  /** True when the path appears in the zone sitemap. */
-  inSitemap?: boolean;
   rawReference: unknown;
 }
 
@@ -183,12 +175,16 @@ export interface ProposalBundle {
   budget: BudgetReport;
 }
 
+/**
+ * Connection details for the live Cloudflare API. There is no mode selector:
+ * the API Shield discovery endpoints are the only data source, so a
+ * configuration that scored well can never have been scored on fields the API
+ * does not actually return.
+ */
 export interface ConnectorConfig {
-  mode: 'api' | 'mcp' | 'snapshot';
   apiToken?: string;
   accountId?: string;
   zoneId?: string;
-  snapshotPath?: string;
   state?: string;
   /** Enrich endpoints with uploaded schema membership. Defaults to true. */
   useSchemas?: boolean;

@@ -36,7 +36,9 @@ function makeEp(partial: Partial<Endpoint> & { path: string; host: string }): En
 
 function makeGroup(partial: Partial<NormalizedGroup> & { normalizedPathPattern: string }): NormalizedGroup {
   const method = partial.method ?? 'GET';
-  const host = partial.normalizedHostPattern ?? 'api.example.com';
+  // A real group's host pattern is derived from its members, so a fixture that
+  // sets member hosts must not be scored against an unrelated default host.
+  const host = partial.normalizedHostPattern ?? partial.members?.[0]?.host ?? 'api.example.com';
   return {
     groupId: 'g1',
     recommendedAction: 'manual_review',
@@ -350,27 +352,18 @@ describe('classifyGroup — false positives that used to occur', () => {
     expect(c.flags).toContain('likely-noise');
   });
 
-  it('uses content type to reject a rendered page on an API-looking path', () => {
+  // The discovery API returns no response metadata, so a rendered page is
+  // recognised from its managed label instead.
+  it('uses a managed web-page label to reject a rendered page on an API-looking path', () => {
     const c = classifyGroup(
       makeGroup({
         normalizedPathPattern: '/api/docs',
         members: [
-          makeEp({ path: '/api/docs', hits: 5000, host: 'www.example.com', contentTypes: ['text/html'] }),
+          makeEp({ path: '/api/docs', hits: 5000, host: 'www.example.com', labels: ['cf-web-page'] }),
         ],
       }),
     );
-    expect(c.signals.map((s) => s.id)).toContain('page-content-type');
-    expect(c.action).not.toBe('save');
-  });
-
-  it('uses sitemap membership to reject a web page', () => {
-    const c = classifyGroup(
-      makeGroup({
-        normalizedPathPattern: '/products/widgets',
-        members: [makeEp({ path: '/products/widgets', hits: 8000, host: 'www.example.com', inSitemap: true })],
-      }),
-    );
-    expect(c.signals.map((s) => s.id)).toContain('in-sitemap');
+    expect(c.signals.map((s) => s.id)).toContain('label-cf-web-page');
     expect(c.action).not.toBe('save');
   });
 });
@@ -399,28 +392,6 @@ describe('classifyGroup — signal handling', () => {
     expect(withAuth.score.combined).toBeGreaterThan(withoutAuth.score.combined);
   });
 
-  it('raises sensitivity for endpoints returning authorization failures', () => {
-    const c = classifyGroup(
-      makeGroup({
-        normalizedPathPattern: '/v1/records',
-        members: [
-          makeEp({ path: '/v1/records', hits: 1000, host: 'api.example.com', statusCodes: { '200': 800, '403': 200 } }),
-        ],
-      }),
-    );
-    expect(c.signals.map((s) => s.id)).toContain('access-controlled');
-  });
-
-  it('treats mostly-404 traffic as scanner noise', () => {
-    const c = classifyGroup(
-      makeGroup({
-        normalizedPathPattern: '/v1/unknown',
-        members: [makeEp({ path: '/v1/unknown', hits: 1000, host: 'api.example.com', statusCodes: { '404': 990, '200': 10 } })],
-      }),
-    );
-    expect(c.signals.map((s) => s.id)).toContain('mostly-not-found');
-  });
-
   it('rewards REST method sets on the same path', () => {
     const single = classifyGroup(makeGroup({ normalizedPathPattern: '/v1/items', methodsOnPath: ['GET'] }));
     const multi = classifyGroup(
@@ -430,11 +401,11 @@ describe('classifyGroup — signal handling', () => {
   });
 
   it('never lets a single keyword hit alone force a save', () => {
-    // Sensitive keyword on a path with no API evidence and an HTML response.
+    // Sensitive keyword on a path with no other API evidence.
     const c = classifyGroup(
       makeGroup({
         normalizedPathPattern: '/admin',
-        members: [makeEp({ path: '/admin', hits: 4, host: 'www.example.com', contentTypes: ['text/html'] })],
+        members: [makeEp({ path: '/admin', hits: 4, host: 'www.example.com' })],
       }),
     );
     expect(c.action).not.toBe('save');
@@ -460,7 +431,6 @@ describe('classifyGroup — confidence', () => {
             method: 'POST',
             hits: 4_000_000,
             host: 'api.example.com',
-            contentTypes: ['application/json'],
             features: { authIdTokens: 90, dataPoints: 50000 },
             inSchema: true,
           }),
@@ -647,6 +617,82 @@ describe('classifyGroup — Cloudflare managed labels', () => {
   });
 });
 
+describe('page-versus-API evidence gate', () => {
+  const at = (host: string, method: string, path: string, partial: Partial<Endpoint> = {}) =>
+    classify(
+      makeGroup({
+        normalizedPathPattern: path,
+        method,
+        normalizedHostPattern: host,
+        members: [makeEp({ path, host, method, hits: 5000, labels: [], ...partial })],
+      }),
+    );
+
+  // Regression: a rendered HTML login form is reached with POST and sits on an
+  // authentication path, which is enough to score api 0.62 / combined 0.74 and
+  // clear the save threshold. Nothing in that evidence distinguishes it from a
+  // JSON endpoint, so it must not be saved on the strength of it.
+  it('does not save an unlabelled login form on write-method and path keywords alone', () => {
+    const group = at('www.acme.com', 'POST', '/users/login');
+    expect(group.score.combined).toBeGreaterThan(0.62);
+    expect(group.recommendedAction).toBe('manual_review');
+    expect(group.flags).toContain('no-api-evidence');
+  });
+
+  // The same shape with the label present is rejected outright rather than
+  // escalated, so the label still does strictly more than the gate.
+  it('still rejects the labelled form outright', () => {
+    const group = at('www.acme.com', 'POST', '/users/login', { labels: ['cf-web-page', 'cf-log-in'] });
+    expect(group.recommendedAction).toBe('ignore');
+  });
+
+  // Escalate, never ignore: absent evidence is not evidence of absence, and
+  // silently dropping a real API is the worse failure for a security tool.
+  it('escalates rather than ignoring, so a real API is never silently dropped', () => {
+    expect(at('acme.com', 'POST', '/checkout/session/{var1}').recommendedAction).toBe('manual_review');
+  });
+
+  it.each([
+    ['an /api segment', 'acme.com', 'POST', '/api/orders', {}],
+    ['a version segment', 'api.acme.com', 'POST', '/v2/payments', {}],
+    ['a GraphQL path', 'acme.com', 'POST', '/graphql', {}],
+    ['an uploaded schema', 'acme.com', 'POST', '/checkout', { inSchema: true }],
+    ['a cf-api-endpoint label', 'acme.com', 'GET', '/orders', { labels: ['cf-api-endpoint'] }],
+    ['observed auth identifiers', 'acme.com', 'POST', '/login', { features: { authIdTokens: 40 } }],
+  ])('still saves an operation evidenced by %s', (_why, host, method, path, partial) => {
+    const group = at(host, method, path, partial as Partial<Endpoint>);
+    expect(group.recommendedAction).toBe('save');
+    expect(group.flags).not.toContain('no-api-evidence');
+  });
+
+  // A confirmed API parent is evidence about the child, so propagation must
+  // clear the gate rather than leaving a stale flag behind.
+  it('clears the gate when a confirmed API parent propagates down', () => {
+    const child = at('www.acme.com', 'POST', '/account/transfer');
+    expect(child.recommendedAction).toBe('manual_review');
+    expect(child.flags).toContain('no-api-evidence');
+
+    const parent = classify(
+      makeGroup({
+        normalizedPathPattern: '/account',
+        normalizedHostPattern: 'www.acme.com',
+        members: [makeEp({ path: '/account', host: 'www.acme.com', labels: ['cf-api-endpoint'] })],
+      }),
+    );
+    const [, propagated] = applySiblingPropagation([parent, child]);
+    expect(propagated.flags).not.toContain('no-api-evidence');
+    expect(propagated.recommendedAction).toBe('save');
+  });
+
+  it('reports zero label evidence as a flag and a confidence penalty', () => {
+    const unlabelled = at('api.acme.com', 'GET', '/v1/orders/{var1}');
+    const labelled = at('api.acme.com', 'GET', '/v1/orders/{var1}', { labels: ['cf-api-endpoint'] });
+    expect(unlabelled.flags).toContain('no-label-evidence');
+    expect(labelled.flags).not.toContain('no-label-evidence');
+    expect(unlabelled.confidence).toBeLessThan(labelled.confidence);
+  });
+});
+
 describe('Cloudflare variable convention', () => {
   // API Shield discovery returns pre-normalized shapes. Lowercasing them
   // produced `{hostvar1}` in every report.
@@ -721,7 +767,7 @@ describe('already-decided operations', () => {
     makeEp({ id: 'c', host: 'api.example.com', method: 'GET', path: '/api/v1/dropped', status: 'ignored' }),
   ];
   const baseOptions: AgentOptions = {
-    connectorConfig: { mode: 'snapshot', zoneId: 'a'.repeat(32) },
+    connectorConfig: { zoneId: 'a'.repeat(32) },
   };
 
   const patterns = (bundle: ProposalBundle) =>

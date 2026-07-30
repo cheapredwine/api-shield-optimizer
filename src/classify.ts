@@ -2,8 +2,6 @@ import type { Action, Endpoint, GroupScore, NormalizedGroup, Signal } from './ty
 import { getDefaultCompiledConfig, type CompiledScoringConfig } from './scoring-config.js';
 
 const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
-const API_CONTENT_TYPES = [/json/i, /grpc/i, /protobuf/i, /^application\/xml/i, /graphql/i];
-const PAGE_CONTENT_TYPES = [/text\/html/i, /text\/plain/i];
 
 export interface ClassificationResult {
   action: Action;
@@ -83,11 +81,7 @@ interface AggregatedEvidence {
   authIdTokens: number;
   hasFeatureData: boolean;
   dataPoints: number;
-  contentTypes: string[];
-  statusCodes: Record<string, number>;
-  cacheHitRatio: number | null;
   inSchema: boolean;
-  inSitemap: boolean;
   /** Union of operation labels across members, lowercased. */
   labels: Set<string>;
   freshest: number | null;
@@ -96,32 +90,17 @@ interface AggregatedEvidence {
 
 function aggregate(members: Endpoint[]): AggregatedEvidence {
   const withTraffic = membersWithTrafficData(members);
-  const contentTypes = new Set<string>();
-  const statusCodes: Record<string, number> = {};
   let authIdTokens = 0;
   let dataPoints = 0;
   let hasFeatureData = false;
-  let cacheRatioSum = 0;
-  let cacheRatioCount = 0;
   let freshest: number | null = null;
   let oldest: number | null = null;
 
   for (const member of members) {
-    for (const ct of member.contentTypes ?? []) contentTypes.add(ct.toLowerCase());
-
-    for (const [code, count] of Object.entries(member.statusCodes ?? {})) {
-      statusCodes[code] = (statusCodes[code] ?? 0) + count;
-    }
-
     if (member.features) {
       hasFeatureData = true;
       authIdTokens = Math.max(authIdTokens, member.features.authIdTokens ?? 0);
       dataPoints += member.features.dataPoints ?? 0;
-    }
-
-    if (typeof member.cacheHitRatio === 'number') {
-      cacheRatioSum += member.cacheHitRatio;
-      cacheRatioCount += 1;
     }
 
     const age = ageInDays(member.lastSeenAt);
@@ -135,36 +114,19 @@ function aggregate(members: Endpoint[]): AggregatedEvidence {
 
   return {
     totalHits: totalKnownHits(members),
-    // A known rate is traffic data. Reporting "no traffic data" for every live
-    // endpoint understated what we actually know.
+    // A known rate counts as traffic data. In API mode it is the only traffic
+    // measure available, so ignoring it reports "no traffic data" for every
+    // live endpoint.
     hasTrafficData: withTraffic.length > 0 || ratePerHour !== null,
     ratePerHour,
     authIdTokens,
     hasFeatureData,
     dataPoints,
-    contentTypes: [...contentTypes],
-    statusCodes,
-    cacheHitRatio: cacheRatioCount > 0 ? cacheRatioSum / cacheRatioCount : null,
     inSchema: members.some((m) => m.inSchema === true),
-    inSitemap: members.some((m) => m.inSitemap === true),
     labels: new Set(members.flatMap((m) => m.labels ?? []).map((l) => l.trim().toLowerCase())),
     freshest,
     oldest,
   };
-}
-
-function statusFraction(statusCodes: Record<string, number>, predicate: (code: number) => boolean): number | null {
-  const entries = Object.entries(statusCodes);
-  if (entries.length === 0) return null;
-  let total = 0;
-  let matched = 0;
-  for (const [code, count] of entries) {
-    const numeric = Number.parseInt(code, 10);
-    if (!Number.isFinite(numeric)) continue;
-    total += count;
-    if (predicate(numeric)) matched += count;
-  }
-  return total === 0 ? null : matched / total;
 }
 
 /**
@@ -213,6 +175,16 @@ export function classifyGroup(
   for (const rule of config.compiled.api) {
     if (rule.regex.test(path)) add('api', rule.id, rule.weight, rule.detail);
   }
+  // Matched against the host, which the path rules never see. A dedicated API
+  // hostname is one of the few page-versus-API discriminators available without
+  // a managed label — but it is still an inference from a name, so it is not
+  // allowed to erode the margin a `cf-web-page` label establishes. An API host
+  // can serve rendered pages, and Cloudflare inspected the response.
+  if (!evidence.labels.has('cf-web-page')) {
+    for (const rule of config.compiled.apiHost) {
+      if (rule.regex.test(group.normalizedHostPattern)) add('api', rule.id, rule.weight, rule.detail);
+    }
+  }
   for (const rule of config.compiled.noise) {
     if (rule.regex.test(path)) {
       add('api', rule.id, rule.weight, rule.detail);
@@ -226,25 +198,8 @@ export function classifyGroup(
     }
   }
 
-  const hasApiContentType = evidence.contentTypes.some((ct) => API_CONTENT_TYPES.some((re) => re.test(ct)));
-  const hasPageContentType = evidence.contentTypes.some((ct) => PAGE_CONTENT_TYPES.some((re) => re.test(ct)));
-  if (hasApiContentType) {
-    add('api', 'api-content-type', 0.35, `structured response content type (${evidence.contentTypes.join(', ')})`);
-  }
-  if (hasPageContentType && !hasApiContentType) {
-    add('api', 'page-content-type', -0.45, 'response content type indicates a rendered web page');
-  }
-
-  if (evidence.inSitemap) {
-    add('api', 'in-sitemap', -0.4, 'path is listed in the zone sitemap, indicating a web page');
-  }
-
-  if (evidence.cacheHitRatio !== null && evidence.cacheHitRatio >= 0.8) {
-    add('api', 'high-cache-hit', -0.3, `served from cache ${(evidence.cacheHitRatio * 100).toFixed(0)}% of the time`);
-  }
-
   // Path variables indicate a parameterised resource, which is evidence FOR an
-  // API. The previous ruleset penalised them, which was backwards.
+  // API rather than against one.
   if (path.includes('{var')) {
     add('api', 'path-variable', 0.12, 'parameterised path segment indicates a REST resource');
     flags.push('path-variable');
@@ -261,12 +216,6 @@ export function classifyGroup(
 
   if (evidence.authIdTokens > 0) {
     add('api', 'auth-tokens-observed', 0.15, `${evidence.authIdTokens} distinct authentication identifiers observed`);
-  }
-
-  const notFoundFraction = statusFraction(evidence.statusCodes, (c) => c === 404);
-  if (notFoundFraction !== null && notFoundFraction >= 0.7) {
-    add('api', 'mostly-not-found', -0.25, 'most responses are 404, indicating scanner noise');
-    flags.push('likely-noise');
   }
 
   if (method === 'OPTIONS') {
@@ -291,11 +240,6 @@ export function classifyGroup(
 
   if (evidence.authIdTokens > 0) {
     add('sensitivity', 'authenticated-traffic', 0.25, 'endpoint carries authenticated traffic');
-  }
-
-  const deniedFraction = statusFraction(evidence.statusCodes, (c) => c === 401 || c === 403);
-  if (deniedFraction !== null && deniedFraction >= 0.1) {
-    add('sensitivity', 'access-controlled', 0.2, 'endpoint returns authorization failures, indicating protected data');
   }
 
   if (WRITE_METHODS.has(method)) {
@@ -333,6 +277,15 @@ export function classifyGroup(
 
   const isZombie = evidence.labels.has('cf-risk-zombie');
 
+  // A rendered page and a JSON endpoint share most of the api axis, so an api
+  // score can clear the save threshold on evidence that does not actually
+  // distinguish the two. Track whether anything did.
+  const hasApiEvidence = signals.some(
+    (s) => s.axis === 'api' && s.weight > 0 && config.compiled.discriminatingApiSignals.has(s.id),
+  );
+  if (!hasApiEvidence) flags.push('no-api-evidence');
+  if (evidence.labels.size === 0) flags.push('no-label-evidence');
+
   let action: Action;
   const reasoning: string[] = [];
 
@@ -366,6 +319,15 @@ export function classifyGroup(
     flags.push('reclaimable-slot');
     reasoning.push(
       'already saved but idle for 32 days (cf-risk-zombie) — review whether to reclaim the operation slot',
+    );
+  } else if (config.apiEvidenceRequiredToSave && !hasApiEvidence) {
+    // Everything on the api axis so far is equally true of a rendered page, so
+    // there is no basis for spending an operation slot. Ask rather than guess:
+    // `ignore` would silently drop a real API that simply has no markers.
+    action = 'manual_review';
+    reasoning.push(
+      `api ${apiScore.toFixed(2)} rests on ${config.baseApiScore} base score plus signals a rendered page ` +
+        'shares — no evidence distinguishes this from a web page',
     );
   } else if (apiScore >= config.apiCertain) {
     action = 'save';
@@ -449,7 +411,6 @@ function computeConfidence(
     flags.push('no-feature-data');
   }
 
-  if (evidence.contentTypes.length > 0) confidence += 0.08;
   if (evidence.inSchema) confidence += 0.15;
 
   // A Cloudflare-managed label is direct evidence about the endpoint, not an
@@ -457,6 +418,10 @@ function computeConfidence(
   const hasClassifyingLabel =
     evidence.labels.has('cf-web-page') || evidence.labels.has('cf-api-endpoint') || evidence.labels.has('cf-mcp');
   if (hasClassifyingLabel) confidence += 0.15;
+
+  // With no labels at all the api-versus-page call rests entirely on path
+  // heuristics, and confidence is meant to report evidence strength.
+  if (evidence.labels.size === 0) confidence -= 0.1;
 
   // Risk labels are added automatically from observed traffic.
   const riskLabelCount = [...evidence.labels].filter((l) => l.startsWith('cf-risk-')).length;
@@ -527,9 +492,16 @@ export function applySiblingPropagation(
     ];
 
     const score: GroupScore = { api: apiScore, sensitivity: group.score.sensitivity, combined };
+    // A confirmed API parent is evidence about this group too, so recompute
+    // rather than carrying the pre-propagation `no-api-evidence` flag forward.
+    const hasApiEvidence = signals.some(
+      (s) => s.axis === 'api' && s.weight > 0 && config.compiled.discriminatingApiSignals.has(s.id),
+    );
     // Preserve the zombie veto; a sibling boost must not turn a reclaimable
     // slot into an automatic save.
-    const action = redecide(score, config, group.flags.includes('zombie-operation'));
+    const action = redecide(score, config, group.flags.includes('zombie-operation'), hasApiEvidence);
+
+    const flags = hasApiEvidence ? group.flags.filter((f) => f !== 'no-api-evidence') : group.flags;
 
     return {
       ...group,
@@ -543,12 +515,17 @@ export function applySiblingPropagation(
           ? [`recommendation changed from ${group.recommendedAction} to ${action} after sibling propagation`]
           : []),
       ],
-      flags: action === 'manual_review' ? group.flags : group.flags.filter((f) => f !== 'borderline-score'),
+      flags: action === 'manual_review' ? flags : flags.filter((f) => f !== 'borderline-score'),
     };
   });
 }
 
-function redecide(score: GroupScore, config: CompiledScoringConfig, isZombie = false): Action {
+function redecide(
+  score: GroupScore,
+  config: CompiledScoringConfig,
+  isZombie = false,
+  hasApiEvidence = true,
+): Action {
   // Mirrors the escalation in `classifyGroup`. Sibling propagation only ever
   // raises the api score, but it re-runs the whole decision, so omitting this
   // would let a rescued endpoint fall back to `ignore`.
@@ -561,6 +538,7 @@ function redecide(score: GroupScore, config: CompiledScoringConfig, isZombie = f
   }
   if (score.api < config.apiFloor) return 'ignore';
   if (isZombie) return 'manual_review';
+  if (config.apiEvidenceRequiredToSave && !hasApiEvidence) return 'manual_review';
   if (score.api >= config.apiCertain) return 'save';
   if (score.combined >= config.saveThreshold) return 'save';
   if (score.combined <= config.ignoreThreshold) return 'ignore';

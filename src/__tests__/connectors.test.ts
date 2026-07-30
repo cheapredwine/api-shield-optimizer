@@ -1,9 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CloudflareApiConnector } from '../connectors/api.js';
-import { SnapshotConnector } from '../connectors/snapshot.js';
-import { createConnector } from '../connectors/index.js';
+import { ShieldOptimizerAgent } from '../agent.js';
 import { ValidationError } from '../validate.js';
-import type { ConnectorConfig } from '../types.js';
+import type { ConnectorConfig, DataConnector, Endpoint } from '../types.js';
 
 const ORIGINAL_FETCH = global.fetch;
 const ZONE_ID = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
@@ -18,7 +17,6 @@ function jsonResponse(payload: unknown, status = 200): Response {
 
 function baseConfig(overrides: Partial<ConnectorConfig> = {}): ConnectorConfig {
   return {
-    mode: 'api',
     apiToken: 'token',
     zoneId: ZONE_ID,
     useSchemas: false,
@@ -464,166 +462,49 @@ describe('real API response shape', () => {
   });
 });
 
-describe('createConnector', () => {
-  it('returns the API connector for api mode', () => {
-    expect(createConnector({ mode: 'api' })).toBeInstanceOf(CloudflareApiConnector);
-  });
+describe('ShieldOptimizerAgent.run', () => {
+  /** Records what it was asked for and returns a fixed operation. */
+  class StubConnector implements DataConnector {
+    calls: ConnectorConfig[] = [];
 
-  it('returns the snapshot connector for snapshot mode', () => {
-    expect(createConnector({ mode: 'snapshot', snapshotPath: 'x.json' })).toBeInstanceOf(SnapshotConnector);
-  });
-
-  it('rejects an unimplemented mode', () => {
-    expect(() => createConnector({ mode: 'mcp' })).toThrow(/not yet implemented/);
-  });
-});
-
-/** Writes `data` to a temp snapshot file, runs `fn`, then cleans up. */
-async function withSnapshot<T>(data: unknown, fn: (file: string) => Promise<T>): Promise<T> {
-  const fs = await import('node:fs/promises');
-  const os = await import('node:os');
-  const path = await import('node:path');
-
-  const file = path.join(os.tmpdir(), `snap-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
-  await fs.writeFile(file, JSON.stringify(data), 'utf-8');
-  try {
-    return await fn(file);
-  } finally {
-    await fs.rm(file, { force: true });
+    async fetchEndpoints(config: ConnectorConfig): Promise<Endpoint[]> {
+      this.calls.push(config);
+      return [
+        {
+          id: 'op-1',
+          accountId: '',
+          zoneId: config.zoneId ?? '',
+          host: 'api.example.com',
+          method: 'POST',
+          path: '/v1/payments',
+          source: 'machinelearning',
+          hits: null,
+          lastSeenAt: new Date().toISOString(),
+          rawReference: {},
+          labels: ['cf-api-endpoint'],
+        } as Endpoint,
+      ];
+    }
   }
-}
 
-describe('SnapshotConnector validation', () => {
-  it('rejects invalid endpoint payloads', async () => {
-    const fs = await import('node:fs/promises');
-    const os = await import('node:os');
-    const path = await import('node:path');
+  // `run()` is fetch-then-analyze. Nothing else covers the wiring between the
+  // two halves, so a stub connector is the only way to reach it without HTTP.
+  it('passes the connector config through and analyses what comes back', async () => {
+    const connector = new StubConnector();
+    const config: ConnectorConfig = { zoneId: ZONE_ID, apiToken: 'token', useSchemas: false };
 
-    const file = path.join(os.tmpdir(), `snap-invalid-${Date.now()}.json`);
-    await fs.writeFile(file, JSON.stringify([{ id: 1 }]), 'utf-8');
+    const bundle = await new ShieldOptimizerAgent(connector).run({ connectorConfig: config });
 
-    await expect(
-      new SnapshotConnector().fetchEndpoints({ mode: 'snapshot', snapshotPath: file }),
-    ).rejects.toThrow(/contains 1 invalid entry/);
-
-    await fs.rm(file, { force: true });
+    expect(connector.calls).toEqual([config]);
+    expect(bundle.proposals).toHaveLength(1);
+    expect(bundle.proposals[0].target.canonicalPattern).toContain('/v1/payments');
+    expect(bundle.proposals[0].action).toBe('save');
   });
 
-  it('accepts endpoints with omitted hits and enrichment fields', async () => {
-    const fs = await import('node:fs/promises');
-    const os = await import('node:os');
-    const path = await import('node:path');
-
-    const file = path.join(os.tmpdir(), `snap-valid-${Date.now()}.json`);
-    await fs.writeFile(
-      file,
-      JSON.stringify({
-        endpoints: [
-          {
-            id: 'e1',
-            accountId: '',
-            zoneId: '',
-            host: 'api.example.com',
-            method: 'GET',
-            path: '/a',
-            source: 'manual',
-            lastSeenAt: '2026-07-28T00:00:00Z',
-            rawReference: {},
-            contentTypes: ['application/json'],
-            statusCodes: { '200': 10 },
-            inSchema: true,
-            features: { authIdTokens: 3 },
-          },
-        ],
-      }),
-      'utf-8',
-    );
-
-    const endpoints = await new SnapshotConnector().fetchEndpoints({ mode: 'snapshot', snapshotPath: file });
-    expect(endpoints).toHaveLength(1);
-    expect(endpoints[0].hits).toBeNull();
-    expect(endpoints[0].inSchema).toBe(true);
-
-    await fs.rm(file, { force: true });
-  });
-
-  // Hand-authored snapshots are the main non-API input, so only host, method
-  // and path are required; the rest is defaulted.
-  it('accepts a minimal hand-authored snapshot', async () => {
-    const endpoints = await withSnapshot(
-      [
-        { host: 'api.example.com', method: 'get', path: '/api/v1/things' },
-        { host: 'api.example.com', method: 'POST', path: '/api/v1/things' },
-      ],
-      (file) => new SnapshotConnector().fetchEndpoints({ mode: 'snapshot', snapshotPath: file }),
-    );
-
-    expect(endpoints).toHaveLength(2);
-    expect(endpoints[0].method).toBe('GET');
-    expect(endpoints[0].id).toBe('snapshot-0');
-    expect(endpoints[0].source).toBe('imported');
-    expect(endpoints[0].hits).toBeNull();
-    expect(endpoints[0].accountId).toBe('');
-  });
-
-  it('names the offending entry and field when validation fails', async () => {
-    await expect(
-      withSnapshot(
-        [
-          { host: 'api.example.com', method: 'GET', path: '/ok' },
-          { host: 'api.example.com', method: 'GET', path: 'missing-slash' },
-        ],
-        (file) => new SnapshotConnector().fetchEndpoints({ mode: 'snapshot', snapshotPath: file }),
-      ),
-    ).rejects.toThrow(/\[1\].*path must be a string starting with "\/"/s);
-  });
-
-  it('reports a missing host rather than silently dropping the entry', async () => {
-    await expect(
-      withSnapshot([{ method: 'GET', path: '/a' }], (file) =>
-        new SnapshotConnector().fetchEndpoints({ mode: 'snapshot', snapshotPath: file }),
-      ),
-    ).rejects.toThrow(/host must be a non-empty string/);
-  });
-
-  it('rejects an unknown discovery source', async () => {
-    await expect(
-      withSnapshot([{ host: 'a.example.com', method: 'GET', path: '/a', source: 'guesswork' }], (file) =>
-        new SnapshotConnector().fetchEndpoints({ mode: 'snapshot', snapshotPath: file }),
-      ),
-    ).rejects.toThrow(/source must be/);
-  });
-
-  it('caps the number of reported problems', async () => {
-    const bad = Array.from({ length: 30 }, () => ({ method: 'GET', path: '/a' }));
-    await expect(
-      withSnapshot(bad, (file) =>
-        new SnapshotConnector().fetchEndpoints({ mode: 'snapshot', snapshotPath: file }),
-      ),
-    ).rejects.toThrow(/and 20 more/);
-  });
-
-  it('reports malformed JSON distinctly from schema problems', async () => {
-    const fs = await import('node:fs/promises');
-    const os = await import('node:os');
-    const path = await import('node:path');
-
-    const file = path.join(os.tmpdir(), `snap-bad-json-${Date.now()}.json`);
-    await fs.writeFile(file, '{ not json', 'utf-8');
-
-    await expect(
-      new SnapshotConnector().fetchEndpoints({ mode: 'snapshot', snapshotPath: file }),
-    ).rejects.toThrow(/is not valid JSON/);
-
-    await fs.rm(file, { force: true });
-  });
-
-  it('lowercases content types so signal matching is case-insensitive', async () => {
-    const endpoints = await withSnapshot(
-      [{ host: 'a.example.com', method: 'GET', path: '/a', contentTypes: ['Application/JSON'] }],
-      (file) => new SnapshotConnector().fetchEndpoints({ mode: 'snapshot', snapshotPath: file }),
-    );
-
-    expect(endpoints[0].contentTypes).toEqual(['application/json']);
+  it('defaults to the live API connector when none is supplied', () => {
+    expect(new ShieldOptimizerAgent()).toBeInstanceOf(ShieldOptimizerAgent);
+    expect(new CloudflareApiConnector()).toBeInstanceOf(CloudflareApiConnector);
   });
 });
+
+

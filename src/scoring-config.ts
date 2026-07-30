@@ -79,19 +79,45 @@ export interface ScoringConfig {
   siblingSourceMin: number;
 
   apiPathPatterns: PatternRule[];
+  /**
+   * Patterns matched against the normalized **host**, not the path. A hostname
+   * dedicated to an API is direct evidence of an API surface and is one of the
+   * few discriminators the discovery API supplies for free.
+   */
+  apiHostPatterns: PatternRule[];
   noisePathPatterns: PatternRule[];
   staticAssetPatterns: PatternRule[];
   sensitivePathPatterns: PatternRule[];
   labelRules: LabelRule[];
+
+  /**
+   * Signal ids that actually distinguish an API from a rendered page.
+   *
+   * Most of the api axis does not. A rendered HTML form is reached with `POST`,
+   * sits on an authentication path, and serves `GET` and `POST` on the same URL
+   * (one renders the form, the other submits it), so `write-method`,
+   * `auth-path-implies-api` and `rest-method-set` are all equally true of a page.
+   * An operation carrying none of the signals listed here has an api score built
+   * entirely from `baseApiScore` plus evidence a page shares, which is not enough
+   * to justify spending an operation slot. See `apiEvidenceRequiredToSave`.
+   */
+  discriminatingApiSignals: string[];
+  /**
+   * When true, an operation with no signal from `discriminatingApiSignals` can
+   * never be saved automatically; it is escalated to `manual_review` instead.
+   * It is never downgraded to `ignore` — absent evidence is not evidence of
+   * absence, and silently dropping a real API is the worse failure.
+   */
+  apiEvidenceRequiredToSave: boolean;
 }
 
 /**
- * Path patterns are anchored to complete path segments. Unanchored substrings
- * caused false positives such as `/privacy-policy` matching `priv` and
- * `/user-guide` matching `user`.
+ * Path patterns are anchored to complete path segments. An unanchored substring
+ * matches inside a word, so `priv` would hit `/privacy-policy` and `user` would
+ * hit `/user-guide`.
  */
 export const DEFAULT_SCORING_CONFIG: ScoringConfig = {
-  rulesetVersion: '2.3.0',
+  rulesetVersion: '2.5.0',
 
   baseApiScore: 0.35,
   baseSensitivityScore: 0.2,
@@ -122,6 +148,25 @@ export const DEFAULT_SCORING_CONFIG: ScoringConfig = {
   siblingBoost: 0.12,
   siblingSourceMin: 0.7,
 
+  // Deliberately excludes `write-method`, `auth-path-implies-api` and
+  // `rest-method-set`: a rendered HTML form matches all three.
+  discriminatingApiSignals: [
+    'in-uploaded-schema',
+    'label-cf-api-endpoint',
+    'label-cf-mcp',
+    'api-prefix',
+    'api-version',
+    'api-hostname',
+    'graphql',
+    'grpc',
+    'rest-suffix',
+    'contract-doc',
+    'path-variable',
+    'auth-tokens-observed',
+    'sibling-api-evidence',
+  ],
+  apiEvidenceRequiredToSave: true,
+
   apiPathPatterns: [
     { id: 'api-prefix', pattern: '(?:^|/)api(?:/|$)', weight: 0.2, detail: 'path contains an /api segment' },
     { id: 'api-version', pattern: '(?:^|/)v\\d+(?:/|$)', weight: 0.18, detail: 'versioned API path segment' },
@@ -133,6 +178,18 @@ export const DEFAULT_SCORING_CONFIG: ScoringConfig = {
       pattern: '(?:^|/)(openapi|swagger)(?:/|$|\\.)',
       weight: 0.15,
       detail: 'API contract document path',
+    },
+  ],
+
+  // Anchored to a complete leftmost label so `rapid.acme.com` and
+  // `therapist.acme.com` do not match. `{hostVar1}` placeholders never match,
+  // which is the safe direction: a collapsed host is not evidence.
+  apiHostPatterns: [
+    {
+      id: 'api-hostname',
+      pattern: '^(api|apis|api-[a-z0-9-]+|[a-z0-9-]+-api|graphql|grpc|rest|gateway)\\.',
+      weight: 0.2,
+      detail: 'hostname is dedicated to an API',
     },
   ],
 
@@ -276,9 +333,12 @@ export interface CompiledPattern {
 export interface CompiledScoringConfig extends ScoringConfig {
   compiled: {
     api: CompiledPattern[];
+    apiHost: CompiledPattern[];
     noise: CompiledPattern[];
     staticAsset: CompiledPattern[];
     sensitive: CompiledPattern[];
+    /** `discriminatingApiSignals` as a set, for per-signal lookup. */
+    discriminatingApiSignals: Set<string>;
   };
 }
 
@@ -296,9 +356,11 @@ export function compileScoringConfig(config: ScoringConfig = DEFAULT_SCORING_CON
     ...config,
     compiled: {
       api: compile(config.apiPathPatterns),
+      apiHost: compile(config.apiHostPatterns),
       noise: compile(config.noisePathPatterns),
       staticAsset: compile(config.staticAssetPatterns),
       sensitive: compile(config.sensitivePathPatterns),
+      discriminatingApiSignals: new Set(config.discriminatingApiSignals),
     },
   };
 }
