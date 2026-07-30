@@ -1,21 +1,24 @@
 {
   "name": "api-shield-optimizer",
-  "version": "0.1.0",
-  "description": "Cloudflare API Shield / Web Assets Endpoint Optimization Agent",
+  "version": "0.2.0",
+  "description": "Cloudflare API Shield endpoint optimization CLI — proposes which discovered endpoints to save or ignore",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "api-shield-optimizer": "dist/cli.js"
+  },
+  "files": ["dist", "README.md"],
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/cli.ts",
-    "dev:worker": "wrangler dev",
-    "deploy:worker:check": "node scripts/deploy-worker-check.mjs",
-    "deploy:worker": "npm run deploy:worker:check && node scripts/deploy-worker.mjs",
+    "propose": "tsx src/cli.ts propose",
+    "review": "tsx src/cli.ts review",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
     "format": "prettier --write \"src/**/*.ts\""
   },
-  "keywords": ["cloudflare", "api-shield", "web-assets", "security", "api-discovery"],
+  "keywords": ["cloudflare", "api-shield", "cli", "security", "api-discovery"],
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.0.0",
