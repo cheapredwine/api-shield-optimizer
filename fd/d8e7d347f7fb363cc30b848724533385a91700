@@ -1,0 +1,19 @@
+src/__tests__/engine.test.ts
+  s_957bdcd74ca3d4::t_ae94979c7f6d9f 1860-1938
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fdd8e7d347f7fb363cc30b848724533385a91700",
+  "prompts": {},
+  "sessions": {
+    "s_957bdcd74ca3d4": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04fb0b2c6ffe58aGper77CyrbX",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jason Sherron <jsherron@cloudflare.com>"
+    }
+  }
+}
