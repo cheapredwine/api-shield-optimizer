@@ -144,8 +144,11 @@ Edit `src/scoring-config.ts`, not `classify.ts`, for anything tunable:
 - Anchor every pattern to whole segments, i.e. `(?:^|/)word(?:/|$)`. An
   unanchored substring matches inside a word: `/priv` hits `privacy-policy`,
   `/user` hits `user-guide`.
-- Bump `rulesetVersion` when weights or thresholds change. It is embedded in
-  every bundle and decision file, and `review` warns on a mismatch.
+- Bump `rulesetVersion` when weights or thresholds change, and also when
+  `STATIC_SEGMENT_ALLOWLIST` or sibling inference changes — those decide which
+  operations exist at all, so they move a recommendation at least as much as a
+  weight does. It is embedded in every bundle and decision file, and `review`
+  warns on a mismatch.
 
 Scoring is two independent axes, `api` and `sensitivity`, combined as
 `0.6 * api + 0.4 * sensitivity`. Decision order in `classify.ts`, first match
@@ -331,12 +334,21 @@ Ordered roughly by risk. Nothing here is blocking, but each is a known weakness
 rather than a speculative nicety.
 
 ### Validate against real high-cardinality data
-Sibling inference has only ever been exercised against synthetic paths, which
-encode assumptions about what real traffic looks like.
-`MIN_SIBLINGS_FOR_VARIABLE = 4` and the stage-2 prefix propagation are the two
-riskiest knobs: propagation can over-merge a genuine sub-resource that is missing
-from `STATIC_SEGMENT_ALLOWLIST`. A sanitized path list from a zone with thousands
-of overlapping operations would settle it.
+Sibling inference is mostly exercised against paths invented for the tests, which
+can only confirm the cases someone already thought of. `MIN_SIBLINGS_FOR_VARIABLE
+= 4` and the stage-2 prefix propagation are the riskiest knobs: propagation can
+over-merge a genuine sub-resource missing from `STATIC_SEGMENT_ALLOWLIST`.
+
+`observed real-world path vocabulary` in `engine.test.ts` is the one test built
+from segments seen in the wild rather than authored, and it found a real allowlist
+gap immediately (`filters`, `browse`). Grow it whenever real paths become
+available; it is worth more per case than any synthetic test here.
+
+What actually settles this is running `propose` against a zone with thousands of
+overlapping operations, since the discovery API is the only source of a real
+operation list. Note that scraping a site for paths is not a substitute and is
+ruled out by *The live API is the only data source*: a sitemap yields page paths,
+not API operations, so it would validate against the wrong population.
 
 ### Percentile thresholds are untuned against a real distribution
 `highTrafficPercentile` (0.9) and `lowTrafficPercentile` (0.25) are guesses. On a

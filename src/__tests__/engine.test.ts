@@ -1857,3 +1857,82 @@ describe('member traffic in the text report', () => {
     expect(memberLine).toContain('no traffic data');
   });
 });
+
+/**
+ * Path vocabulary observed in the wild rather than invented for a test.
+ *
+ * These segments come from a live retail site's public `robots.txt`. They matter
+ * because every other normalization test uses paths chosen by whoever wrote the
+ * test, which can only confirm the cases already thought of. Real vocabulary is
+ * the only thing that catches an allowlist gap.
+ *
+ * The literals are real. Where a case needs an identifier family alongside them,
+ * the family is representative — the point of each case is that the real literal
+ * survives contact with one.
+ */
+describe('observed real-world path vocabulary', () => {
+  // Flattened compound words and camelCase run together look like opaque ids by
+  // length alone. They are named endpoints and must stay literal.
+  it.each([
+    'getspinnerdatalarge',
+    'vehiclehistoryreport',
+    'carvanalocations',
+    'post-sale-dashboard',
+    'promotion-rules',
+    'advanced-search',
+  ])('keeps the observed segment %s literal', (segment) => {
+    expect(isVariableSegment(segment)).toBe(false);
+    expect(isHighCardinalitySegment(segment)).toBe(false);
+  });
+
+  // Regression: `/cars/filters` is a real path. Beside a word-shaped identifier
+  // family it shares prefix, depth, continuation and coarse shape, so sibling
+  // inference absorbed it into `/cars/{var1}` — hiding an operation and
+  // misattributing its traffic to a group that does not exist.
+  it.each(['filters', 'browse', 'compare', 'sort'])(
+    'does not absorb the action segment %s into a word-shaped identifier family',
+    (action) => {
+      const paths = [
+        '/cars/honda-civic',
+        '/cars/toyota-camry',
+        '/cars/ford-explorer',
+        '/cars/mazda-miata',
+        '/cars/subaru-outback',
+        `/cars/${action}`,
+      ];
+      const inferred = inferSiblingVariables(paths);
+
+      // The identifier family still collapses; only the action stays literal.
+      expect([...(inferred.get('/cars/honda-civic') ?? [])]).toEqual([1]);
+      expect([...(inferred.get(`/cars/${action}`) ?? [])]).toEqual([]);
+    },
+  );
+
+  // A digit-bearing identifier family is separated by shape alone, with no
+  // allowlist entry needed. This is what `segmentShape` buys.
+  it('separates an action from a digit-bearing identifier family by shape', () => {
+    const paths = [
+      '/cars/2019-honda-civic-ex',
+      '/cars/2020-toyota-camry-le',
+      '/cars/2018-ford-f150-xlt',
+      '/cars/2021-mazda-cx5-touring',
+      '/cars/2017-bmw-330i-sport',
+      '/cars/filters',
+    ];
+    const inferred = inferSiblingVariables(paths);
+    expect([...(inferred.get('/cars/2019-honda-civic-ex') ?? [])]).toEqual([1]);
+    expect([...(inferred.get('/cars/filters') ?? [])]).toEqual([]);
+  });
+
+  // Two siblings is below MIN_SIBLINGS_FOR_VARIABLE, so these stay split. The
+  // case is recorded because both are plausible API endpoints: if a zone exposes
+  // four or more of them under one prefix they would collapse, and this is the
+  // shape of path where that would cost a real operation.
+  it('leaves two same-shape siblings under one prefix alone', () => {
+    const paths = ['/search/getspinnerdatalarge', '/search/vehiclehistoryreport'];
+    const inferred = inferSiblingVariables(paths);
+    for (const path of paths) {
+      expect([...(inferred.get(path) ?? [])]).toEqual([]);
+    }
+  });
+});

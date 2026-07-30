@@ -134,7 +134,7 @@ export interface ScoringConfig {
  * hit `/user-guide`.
  */
 export const DEFAULT_SCORING_CONFIG: ScoringConfig = {
-  rulesetVersion: '2.6.0',
+  rulesetVersion: '2.7.0',
 
   baseApiScore: 0.35,
   baseSensitivityScore: 0.2,
