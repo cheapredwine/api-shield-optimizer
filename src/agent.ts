@@ -153,6 +153,15 @@ export class ShieldOptimizerAgent {
    * Reports how the proposed saves fit within the zone's operation allowance.
    * API Shield caps saved operations per plan, so the useful question is not
    * "what could be saved" but "what are the best N to save".
+   *
+   * Known quirk: `proposedSaves` counts every group classified `save`
+   * regardless of whether it is already saved, so a group that is both
+   * `alreadySaved` and still recommended `save` is subtracted from `limit`
+   * twice (once via `alreadySaved`, once via `proposedSaves`) even though it
+   * occupies one real slot. A zone sitting exactly at capacity, where every
+   * saved operation still correctly scores `save`, reports `overBudget: true`
+   * when it should not. See `src/__tests__/engine.test.ts`'s "budget and
+   * ranking" tests for the exact numbers this produces.
    */
   private buildBudget(
     groups: NormalizedGroup[],

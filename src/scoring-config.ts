@@ -134,7 +134,7 @@ export interface ScoringConfig {
  * hit `/user-guide`.
  */
 export const DEFAULT_SCORING_CONFIG: ScoringConfig = {
-  rulesetVersion: '2.7.0',
+  rulesetVersion: '2.8.0',
 
   baseApiScore: 0.35,
   baseSensitivityScore: 0.2,
@@ -144,8 +144,8 @@ export const DEFAULT_SCORING_CONFIG: ScoringConfig = {
 
   apiFloor: 0.4,
   // An endpoint with no signal either way sits at `baseApiScore` (0.35), while a
-  // managed `cf-web-page` label pulls it to ~0.21. The 0.3 floor separates
-  // "unknown" from "known not to be an API".
+  // managed `cf-web-page` label (weight -0.5) pulls it to 0 after clamping. The
+  // 0.3 floor separates "unknown" from "known not to be an API".
   sensitivityRescueThreshold: 0.5,
   sensitivityRescueApiFloor: 0.3,
   apiCertain: 0.8,
@@ -175,6 +175,15 @@ export const DEFAULT_SCORING_CONFIG: ScoringConfig = {
     'in-uploaded-schema',
     'label-cf-api-endpoint',
     'label-cf-mcp',
+    // A learned schema or an API-shaped attack both imply an API surface —
+    // see the matching comment on the `labelRules` entries below. Without
+    // these three, an operation labelled only e.g. `cf-risk-bola-enumeration`
+    // clears `saveThreshold` on combined score but is still routed to
+    // `manual_review` by the evidence gate, contradicting the label's own
+    // weight.
+    'label-cf-risk-missing-schema',
+    'label-cf-risk-bola-enumeration',
+    'label-cf-risk-bola-pollution',
     'api-prefix',
     'api-version',
     'api-hostname',
@@ -461,6 +470,19 @@ export function validateScoringOverrides(overrides: Partial<ScoringConfig>): voi
     problems.push(
       `lowTrafficPercentile (${merged.lowTrafficPercentile}) must not exceed ` +
         `highTrafficPercentile (${merged.highTrafficPercentile})`,
+    );
+  }
+  // `combined = apiWeight * api + sensitivityWeight * sensitivity` is clamped
+  // to [0, 1], but `saveThreshold`/`ignoreThreshold` are calibrated assuming the
+  // weights sum to 1. An override that changes one weight without the other —
+  // `apiWeight: 0.9` with the default `sensitivityWeight: 0.4` — lets combined
+  // saturate at the clamp far more easily than those thresholds assume, silently
+  // changing what "save" and "ignore" mean.
+  const weightSum = merged.apiWeight + merged.sensitivityWeight;
+  if (Math.abs(weightSum - 1) > 1e-9) {
+    problems.push(
+      `apiWeight (${merged.apiWeight}) + sensitivityWeight (${merged.sensitivityWeight}) must sum to 1 ` +
+        `(got ${weightSum})`,
     );
   }
 

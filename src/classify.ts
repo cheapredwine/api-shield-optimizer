@@ -143,8 +143,8 @@ interface AggregatedEvidence {
   inSchema: boolean;
   /** Union of operation labels across members, lowercased. */
   labels: Set<string>;
+  /** Age in days of the most recently observed member, or `null` if unknown. */
   freshest: number | null;
-  oldest: number | null;
 }
 
 function aggregate(members: Endpoint[]): AggregatedEvidence {
@@ -153,7 +153,6 @@ function aggregate(members: Endpoint[]): AggregatedEvidence {
   let dataPoints = 0;
   let hasFeatureData = false;
   let freshest: number | null = null;
-  let oldest: number | null = null;
 
   for (const member of members) {
     if (member.features) {
@@ -165,7 +164,6 @@ function aggregate(members: Endpoint[]): AggregatedEvidence {
     const age = ageInDays(member.lastSeenAt);
     if (age !== null) {
       freshest = freshest === null ? age : Math.min(freshest, age);
-      oldest = oldest === null ? age : Math.max(oldest, age);
     }
   }
 
@@ -184,7 +182,6 @@ function aggregate(members: Endpoint[]): AggregatedEvidence {
     inSchema: members.some((m) => m.inSchema === true),
     labels: new Set(members.flatMap((m) => m.labels ?? []).map((l) => l.trim().toLowerCase())),
     freshest,
-    oldest,
   };
 }
 
@@ -353,69 +350,10 @@ export function classifyGroup(
   if (!hasApiEvidence) flags.push('no-api-evidence');
   if (evidence.labels.size === 0) flags.push('no-label-evidence');
 
-  let action: Action;
-  const reasoning: string[] = [];
-
-  // The `apiFloor` check below is a hard short-circuit, so a sensitive endpoint
-  // that does not look API-shaped — an unlabelled `POST /checkout/session/{id}`
-  // scores api 0.35 against a 0.40 floor — would be dropped without its
-  // sensitivity ever being weighed. Silently discarding a financial endpoint is
-  // the worst failure direction for a security tool, so escalate to a human
-  // rather than decide.
-  const sensitiveButNotApiShaped =
-    apiScore < config.apiFloor &&
-    apiScore >= config.sensitivityRescueApiFloor &&
-    sensitivityScore >= config.sensitivityRescueThreshold;
-
-  if (sensitiveButNotApiShaped) {
-    action = 'manual_review';
-    flags.push('sensitive-not-api-shaped');
-    reasoning.push(
-      `API confidence ${apiScore.toFixed(2)} is below the ${config.apiFloor} floor, but sensitivity ` +
-        `${sensitivityScore.toFixed(2)} is too high to ignore without a human decision`,
-    );
-  } else if (apiScore < config.apiFloor) {
-    action = 'ignore';
-    reasoning.push(`API confidence ${apiScore.toFixed(2)} is below the ${config.apiFloor} floor — not an API surface`);
-  } else if (isZombie) {
-    // An already-saved operation with no traffic for 32 days is definitionally
-    // an API, so the `apiCertain` shortcut would save it unconditionally. But it
-    // is already saved, and the useful question is whether to reclaim its
-    // operation slot. That is a judgement call, not an automatic save.
-    action = 'manual_review';
-    flags.push('reclaimable-slot');
-    reasoning.push(
-      'already saved but idle for 32 days (cf-risk-zombie) — review whether to reclaim the operation slot',
-    );
-  } else if (config.apiEvidenceRequiredToSave && !hasApiEvidence) {
-    // Everything on the api axis so far is equally true of a rendered page, so
-    // there is no basis for spending an operation slot. Ask rather than guess:
-    // `ignore` would silently drop a real API that simply has no markers.
-    action = 'manual_review';
-    reasoning.push(
-      `api ${apiScore.toFixed(2)} rests on ${config.baseApiScore} base score plus signals a rendered page ` +
-        'shares — no evidence distinguishes this from a web page',
-    );
-  } else if (apiScore >= config.apiCertain) {
-    action = 'save';
-    reasoning.push(`API confidence ${apiScore.toFixed(2)} is conclusive`);
-  } else if (combined >= config.saveThreshold) {
-    action = 'save';
-    reasoning.push(
-      `combined score ${combined.toFixed(2)} clears the ${config.saveThreshold} save threshold ` +
-        `(api ${apiScore.toFixed(2)}, sensitivity ${sensitivityScore.toFixed(2)})`,
-    );
-  } else if (combined <= config.ignoreThreshold) {
-    action = 'ignore';
-    reasoning.push(`combined score ${combined.toFixed(2)} is at or below the ${config.ignoreThreshold} ignore threshold`);
-  } else {
-    action = 'manual_review';
-    flags.push('borderline-score');
-    reasoning.push(
-      `combined score ${combined.toFixed(2)} falls between the ignore and save thresholds ` +
-        `(api ${apiScore.toFixed(2)}, sensitivity ${sensitivityScore.toFixed(2)})`,
-    );
-  }
+  const outcome = decide(score, config, isZombie, hasApiEvidence);
+  const action = outcome.action;
+  if (outcome.flag) flags.push(outcome.flag);
+  const reasoning: string[] = [outcome.reasoning];
 
   for (const signal of signals) {
     reasoning.push(`${signal.axis}: ${signal.detail} (${signal.weight >= 0 ? '+' : ''}${signal.weight.toFixed(2)})`);
@@ -499,7 +437,7 @@ function computeConfidence(
     confidence += 0.08;
   }
 
-  if (evidence.oldest !== null && evidence.freshest !== null && evidence.freshest > config.staleAfterDays) {
+  if (evidence.freshest !== null && evidence.freshest > config.staleAfterDays) {
     confidence -= 0.1;
     flags.push('stale-observation');
   }
@@ -565,11 +503,28 @@ export function applySiblingPropagation(
     const hasApiEvidence = signals.some(
       (s) => s.axis === 'api' && s.weight > 0 && config.compiled.discriminatingApiSignals.has(s.id),
     );
-    // Preserve the zombie veto; a sibling boost must not turn a reclaimable
-    // slot into an automatic save.
-    const action = redecide(score, config, group.flags.includes('zombie-operation'), hasApiEvidence);
+    const isZombie = group.flags.includes('zombie-operation');
+    // Re-runs the same decision ladder `classifyGroup` used, via `decide()`, so
+    // the zombie veto is preserved and the action can never drift from the
+    // reason reported for it.
+    const outcome = decide(score, config, isZombie, hasApiEvidence);
+    const action = outcome.action;
 
-    const flags = hasApiEvidence ? group.flags.filter((f) => f !== 'no-api-evidence') : group.flags;
+    // Strip every flag the original decision could have set — including the
+    // reason for the pre-propagation action — so a stale reason is never
+    // reported alongside a decision it no longer explains. `decide()` supplies
+    // the replacement, if any.
+    const staleDecisionFlags = new Set(['sensitive-not-api-shaped', 'reclaimable-slot', 'borderline-score']);
+    let flags = group.flags.filter((f) => !staleDecisionFlags.has(f));
+    if (hasApiEvidence) flags = flags.filter((f) => f !== 'no-api-evidence');
+    if (outcome.flag) flags = [...flags, outcome.flag];
+
+    // The decision reasoning is always the first entry classifyGroup pushed.
+    // Replace it unconditionally, not just when the action changes: the score
+    // numbers it quotes go stale on any boost, and the rule that fires can
+    // change (rule 1 to rule 8, say) while the resulting action — both
+    // `manual_review` — stays the same, which a same-action check would miss.
+    const reasoning = [outcome.reasoning, ...group.reasoning.slice(1)];
 
     return {
       ...group,
@@ -577,38 +532,120 @@ export function applySiblingPropagation(
       signals,
       recommendedAction: action,
       reasoning: [
-        ...group.reasoning,
+        ...reasoning,
         `api: parent path ${matchedAncestor} is a confirmed API surface (+${config.siblingBoost.toFixed(2)})`,
         ...(action !== group.recommendedAction
           ? [`recommendation changed from ${group.recommendedAction} to ${action} after sibling propagation`]
           : []),
       ],
-      flags: action === 'manual_review' ? flags : flags.filter((f) => f !== 'borderline-score'),
+      flags,
     };
   });
 }
 
-function redecide(
+interface DecisionOutcome {
+  action: Action;
+  /** The flag identifying which rule fired, or `null` for rules that add none. */
+  flag: string | null;
+  reasoning: string;
+}
+
+/**
+ * The decision ladder from the module doc comment, rules 1 and 3–8. Shared by
+ * `classifyGroup` and `applySiblingPropagation` so the action and its reported
+ * reason can never diverge: a second, hand-mirrored copy of this ladder is
+ * exactly how a rescored group ended up with an action from one rule and a
+ * flag/reasoning string from another.
+ */
+function decide(
   score: GroupScore,
   config: CompiledScoringConfig,
-  isZombie = false,
-  hasApiEvidence = true,
-): Action {
-  // Mirrors the escalation in `classifyGroup`. Sibling propagation only ever
-  // raises the api score, but it re-runs the whole decision, so omitting this
-  // would let a rescued endpoint fall back to `ignore`.
-  if (
-    score.api < config.apiFloor &&
-    score.api >= config.sensitivityRescueApiFloor &&
-    score.sensitivity >= config.sensitivityRescueThreshold
-  ) {
-    return 'manual_review';
+  isZombie: boolean,
+  hasApiEvidence: boolean,
+): DecisionOutcome {
+  const { api: apiScore, sensitivity: sensitivityScore, combined } = score;
+
+  // The `apiFloor` check below is a hard short-circuit, so a sensitive endpoint
+  // that does not look API-shaped — an unlabelled `POST /checkout/session/{id}`
+  // scores api 0.35 against a 0.40 floor — would be dropped without its
+  // sensitivity ever being weighed. Silently discarding a financial endpoint is
+  // the worst failure direction for a security tool, so escalate to a human
+  // rather than decide.
+  const sensitiveButNotApiShaped =
+    apiScore < config.apiFloor &&
+    apiScore >= config.sensitivityRescueApiFloor &&
+    sensitivityScore >= config.sensitivityRescueThreshold;
+
+  if (sensitiveButNotApiShaped) {
+    return {
+      action: 'manual_review',
+      flag: 'sensitive-not-api-shaped',
+      reasoning:
+        `API confidence ${apiScore.toFixed(2)} is below the ${config.apiFloor} floor, but sensitivity ` +
+        `${sensitivityScore.toFixed(2)} is too high to ignore without a human decision`,
+    };
   }
-  if (score.api < config.apiFloor) return 'ignore';
-  if (isZombie) return 'manual_review';
-  if (config.apiEvidenceRequiredToSave && !hasApiEvidence) return 'manual_review';
-  if (score.api >= config.apiCertain) return 'save';
-  if (score.combined >= config.saveThreshold) return 'save';
-  if (score.combined <= config.ignoreThreshold) return 'ignore';
-  return 'manual_review';
+
+  if (apiScore < config.apiFloor) {
+    return {
+      action: 'ignore',
+      flag: null,
+      reasoning: `API confidence ${apiScore.toFixed(2)} is below the ${config.apiFloor} floor — not an API surface`,
+    };
+  }
+
+  if (isZombie) {
+    // An already-saved operation with no traffic for 32 days is definitionally
+    // an API, so the `apiCertain` shortcut would save it unconditionally. But it
+    // is already saved, and the useful question is whether to reclaim its
+    // operation slot. That is a judgement call, not an automatic save.
+    return {
+      action: 'manual_review',
+      flag: 'reclaimable-slot',
+      reasoning: 'already saved but idle for 32 days (cf-risk-zombie) — review whether to reclaim the operation slot',
+    };
+  }
+
+  if (config.apiEvidenceRequiredToSave && !hasApiEvidence) {
+    // Everything on the api axis so far is equally true of a rendered page, so
+    // there is no basis for spending an operation slot. Ask rather than guess:
+    // `ignore` would silently drop a real API that simply has no markers.
+    return {
+      action: 'manual_review',
+      flag: null,
+      reasoning:
+        `api ${apiScore.toFixed(2)} rests on ${config.baseApiScore} base score plus signals a rendered page ` +
+        'shares — no evidence distinguishes this from a web page',
+    };
+  }
+
+  if (apiScore >= config.apiCertain) {
+    return { action: 'save', flag: null, reasoning: `API confidence ${apiScore.toFixed(2)} is conclusive` };
+  }
+
+  if (combined >= config.saveThreshold) {
+    return {
+      action: 'save',
+      flag: null,
+      reasoning:
+        `combined score ${combined.toFixed(2)} clears the ${config.saveThreshold} save threshold ` +
+        `(api ${apiScore.toFixed(2)}, sensitivity ${sensitivityScore.toFixed(2)})`,
+    };
+  }
+
+  if (combined <= config.ignoreThreshold) {
+    return {
+      action: 'ignore',
+      flag: null,
+      reasoning: `combined score ${combined.toFixed(2)} is at or below the ${config.ignoreThreshold} ignore threshold`,
+    };
+  }
+
+  return {
+    action: 'manual_review',
+    flag: 'borderline-score',
+    reasoning:
+      `combined score ${combined.toFixed(2)} falls between the ignore and save thresholds ` +
+      `(api ${apiScore.toFixed(2)}, sensitivity ${sensitivityScore.toFixed(2)})`,
+  };
 }

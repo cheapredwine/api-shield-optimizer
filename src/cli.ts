@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { askOnce } from './prompt.js';
+import { createInterface } from 'node:readline';
+import { LineReader, type PromptStreams } from './prompt.js';
 import { saveZoneIdToConfig } from './config.js';
 import { ShieldOptimizerAgent } from './agent.js';
 import { CloudflareApiConnector } from './connectors/index.js';
@@ -11,7 +12,7 @@ import type { Action, ConnectorConfig, DecisionFile, ProposalBundle } from './ty
 import type { ScoringConfig } from './scoring-config.js';
 import { ValidationError, assertCloudflareId, parseBoundedInt, parseDiscoveryStates } from './validate.js';
 
-interface ConfigFile {
+export interface ConfigFile {
   tokenFile?: string;
   zoneId?: string;
   accountId?: string;
@@ -36,12 +37,18 @@ const DEFAULT_CONFIG: ConfigFile = {
   maxGroups: 0,
 };
 
-function fail(message: string): never {
+/**
+ * Exported so tests can drive individual CLI helpers directly, without going
+ * through `program.parseAsync()` and without a real `process.exit`. Not part
+ * of the package's public API (see `index.ts`, which does not re-export this
+ * module) — this is a testing seam, not a supported import for consumers.
+ */
+export function fail(message: string): never {
   console.error(`Error: ${message}`);
   process.exit(1);
 }
 
-async function loadJson<T>(path: string, label: string): Promise<T> {
+export async function loadJson<T>(path: string, label: string): Promise<T> {
   const fs = await import('node:fs/promises');
   let raw: string;
   try {
@@ -64,7 +71,7 @@ async function loadJson<T>(path: string, label: string): Promise<T> {
  *   2. `./optimizer.config.json`
  *   3. `$XDG_CONFIG_HOME/api-shield-optimizer/config.json`
  */
-async function resolveConfigPath(explicit?: string): Promise<{ path: string; existed: boolean }> {
+export async function resolveConfigPath(explicit?: string): Promise<{ path: string; existed: boolean }> {
   const fs = await import('node:fs/promises');
   const path = await import('node:path');
   const os = await import('node:os');
@@ -101,14 +108,14 @@ async function resolveConfigPath(explicit?: string): Promise<{ path: string; exi
  * A run needs a zone plus a token, and the token legitimately arrives from the
  * environment rather than from any flag.
  */
-function optionsAreSelfSufficient(opts: { zoneId?: string; tokenFile?: string }): boolean {
+export function optionsAreSelfSufficient(opts: { zoneId?: string; tokenFile?: string }): boolean {
   const hasToken = Boolean(opts.tokenFile ?? process.env.CF_API_TOKEN);
   return Boolean(opts.zoneId) && hasToken;
 }
 
 /** Loads config, creating a template on first run. Returns the resolved path so
  *  callers can persist choices back to it. */
-async function loadConfigOrScaffold(
+export async function loadConfigOrScaffold(
   explicit?: string,
   opts: { requireExisting?: boolean; alreadySufficient?: boolean } = {},
 ): Promise<{ config: ConfigFile; path?: string }> {
@@ -146,7 +153,7 @@ async function loadConfigOrScaffold(
  * the config file holds no inline token, so the config can be copied or shared
  * without carrying a secret.
  */
-async function resolveToken(opts: { tokenFile?: string }): Promise<string | undefined> {
+export async function resolveToken(opts: { tokenFile?: string }): Promise<string | undefined> {
   if (opts.tokenFile) {
     const fs = await import('node:fs/promises');
     try {
@@ -172,69 +179,107 @@ async function resolveToken(opts: { tokenFile?: string }): Promise<string | unde
  * Prompts for a zone and offers to remember the choice.
  *
  * `configPath` is where the selection is persisted. Without it the prompt still
- * works, it just cannot be remembered.
+ * works, it just cannot be remembered. `streams` defaults to `process.stdin`/
+ * `process.stderr`; tests inject a `Readable`/`Writable` pair instead of
+ * mutating global `process.stdin`.
+ *
+ * Both prompts share a single `readline.Interface`/`LineReader`, rather than
+ * each opening and closing its own via a separate `askOnce()` call. A second
+ * `askOnce()` recreates the exact "line arrives before the next `question`
+ * call" hazard `LineReader` exists to prevent (see `prompt.ts`), just one
+ * level up: if the input stream delivers both answers before the first
+ * `readline.Interface` closes, that first interface's own `LineReader` queues
+ * the second line internally and takes it down with it on `close()` — the
+ * second `askOnce()` then opens a fresh, empty `LineReader` and waits forever
+ * on a stream that already ended.
  */
-async function selectZoneInteractively(apiToken: string, configPath?: string): Promise<string> {
+export async function selectZoneInteractively(
+  apiToken: string,
+  configPath?: string,
+  streams: PromptStreams = {},
+): Promise<string> {
   const connector = new CloudflareApiConnector();
   const zones = await connector.listZones(apiToken);
+  const output = streams.output ?? process.stderr;
+  const err = (line: string): void => {
+    output.write(`${line}\n`);
+  };
 
   if (zones.length === 0) {
     fail('no zones found for this token');
   }
 
-  console.error('Available zones:');
+  err('Available zones:');
   zones.forEach((z, i) => {
-    console.error(`  ${i + 1}. ${z.name} (${z.id})`);
+    err(`  ${i + 1}. ${z.name} (${z.id})`);
   });
 
-  const answer = await askOnce('Select zone number: ');
+  const rl = createInterface({ input: streams.input ?? process.stdin, output, terminal: false });
+  const reader = new LineReader(rl, output);
 
-  // End of input. Fail loudly rather than hanging on a promise that will never
-  // settle, which is what the previous readline callback did.
-  if (answer === null) {
-    fail('no zone selected (end of input). Pass --zone-id, or set zoneId in the config, to run non-interactively.');
+  try {
+    const answer = await reader.ask('Select zone number: ');
+
+    // End of input. Fail loudly rather than hanging on a promise that will
+    // never settle, which is what the previous readline callback did.
+    if (answer === null) {
+      fail('no zone selected (end of input). Pass --zone-id, or set zoneId in the config, to run non-interactively.');
+    }
+
+    const idx = Number.parseInt(answer, 10) - 1;
+    if (Number.isNaN(idx) || idx < 0 || idx >= zones.length) {
+      fail(`invalid zone selection '${answer}'; expected a number between 1 and ${zones.length}`);
+    }
+
+    const selected = zones[idx];
+
+    if (configPath) {
+      await offerToRememberZone(configPath, selected, reader, output);
+    }
+
+    return selected.id;
+  } finally {
+    rl.close();
   }
-
-  const idx = Number.parseInt(answer, 10) - 1;
-  if (Number.isNaN(idx) || idx < 0 || idx >= zones.length) {
-    fail(`invalid zone selection '${answer}'; expected a number between 1 and ${zones.length}`);
-  }
-
-  const selected = zones[idx];
-
-  if (configPath) {
-    await offerToRememberZone(configPath, selected);
-  }
-
-  return selected.id;
 }
 
 /**
  * Asks before editing the config file. The file is hand-authored, so it is not
  * modified without consent, and only the `zoneId` field is touched.
+ *
+ * Takes an existing `LineReader` rather than opening its own — see the note on
+ * `selectZoneInteractively`, its only caller.
  */
-async function offerToRememberZone(configPath: string, zone: { id: string; name: string }): Promise<void> {
-  const answer = await askOnce(`Remember ${zone.name} as zoneId in ${configPath}? [y/N]: `);
+export async function offerToRememberZone(
+  configPath: string,
+  zone: { id: string; name: string },
+  reader: LineReader,
+  output: NodeJS.WritableStream,
+): Promise<void> {
+  const err = (line: string): void => {
+    output.write(`${line}\n`);
+  };
+  const answer = await reader.ask(`Remember ${zone.name} as zoneId in ${configPath}? [y/N]: `);
   if (answer === null || !/^y(es)?$/i.test(answer)) return;
 
   const result = await saveZoneIdToConfig(configPath, zone.id);
 
   switch (result) {
     case 'saved':
-      console.error(`Saved zoneId to ${configPath}.`);
+      err(`Saved zoneId to ${configPath}.`);
       break;
     case 'unchanged':
       break;
     case 'unreadable':
-      console.error(`Could not parse ${configPath}; leaving it unchanged.`);
+      err(`Could not parse ${configPath}; leaving it unchanged.`);
       break;
     case 'unwritable':
-      console.error(`Could not write ${configPath}; leaving it unchanged.`);
+      err(`Could not write ${configPath}; leaving it unchanged.`);
       break;
   }
 }
 
-function parseActionList(raw: string | undefined): Action[] | undefined {
+export function parseActionList(raw: string | undefined): Action[] | undefined {
   if (!raw) return undefined;
   const valid: Action[] = ['save', 'ignore', 'manual_review'];
   const requested = raw
@@ -248,7 +293,7 @@ function parseActionList(raw: string | undefined): Action[] | undefined {
   return requested as Action[];
 }
 
-function parseConfidence(raw: string | undefined): number | undefined {
+export function parseConfidence(raw: string | undefined): number | undefined {
   if (raw === undefined) return undefined;
   const value = Number.parseFloat(raw);
   if (!Number.isFinite(value) || value < 0 || value > 1) {
@@ -257,20 +302,24 @@ function parseConfidence(raw: string | undefined): number | undefined {
   return value;
 }
 
-async function writeFileEnsuringDir(filePath: string, contents: string): Promise<void> {
+export async function writeFileEnsuringDir(filePath: string, contents: string): Promise<void> {
   const fs = await import('node:fs/promises');
   const path = await import('node:path');
-  const dir = path.dirname(path.resolve(filePath));
-  await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(filePath, contents, 'utf-8');
+  // Resolve once and reuse the same absolute path for both calls. Passing the
+  // original (possibly relative) `filePath` to `writeFile` after resolving a
+  // separate absolute path just for `mkdir` relies on the two calls agreeing
+  // on `process.cwd()` by coincidence rather than by construction.
+  const resolved = path.resolve(filePath);
+  await fs.mkdir(path.dirname(resolved), { recursive: true });
+  await fs.writeFile(resolved, contents, 'utf-8');
 }
 
-function timestamp(): string {
+export function timestamp(): string {
   return new Date().toISOString().replace(/[:.]/g, '-');
 }
 
 /** Applies action/confidence filters to a bundle, recomputing the summary. */
-function filterBundle(bundle: ProposalBundle, only?: Action[], minConfidence?: number): ProposalBundle {
+export function filterBundle(bundle: ProposalBundle, only?: Action[], minConfidence?: number): ProposalBundle {
   if (!only && minConfidence === undefined) return bundle;
 
   const proposals = bundle.proposals.filter((p) => {
@@ -297,18 +346,19 @@ function filterBundle(bundle: ProposalBundle, only?: Action[], minConfidence?: n
   };
 }
 
-interface SharedOpts {
+export interface SharedOpts {
   config?: string;
   tokenFile?: string;
   zoneId?: string;
   accountId?: string;
 }
 
-async function buildConnectorConfig(
+export async function buildConnectorConfig(
   opts: SharedOpts & { state?: string; schemas?: boolean },
   fileConfig: ConfigFile,
   requireZone = true,
   configPath?: string,
+  streams: PromptStreams = {},
 ): Promise<ConnectorConfig> {
   // Check anything the user typed before checking what they may not have set up
   // yet. A malformed --zone-id otherwise surfaces as "API token required",
@@ -328,7 +378,7 @@ async function buildConnectorConfig(
 
   let zoneId = suppliedZoneId;
   if (apiToken && requireZone && (!zoneId || zoneId === '')) {
-    zoneId = await selectZoneInteractively(apiToken, configPath);
+    zoneId = await selectZoneInteractively(apiToken, configPath, streams);
   }
 
   zoneId = assertCloudflareId(zoneId, 'zoneId');
@@ -344,12 +394,19 @@ async function buildConnectorConfig(
   };
 }
 
-const program = new Command();
+/**
+ * Exported so tests can drive the real command wiring via
+ * `program.parseAsync(argv, { from: 'user' })` instead of spawning a
+ * subprocess. Not part of the package's public API — `index.ts` does not
+ * re-export this module, and consumers should use the CLI binary or the
+ * library exports in `index.ts`, not this `Command` instance directly.
+ */
+export const program = new Command();
 
 program
   .name('api-shield-optimizer')
   .description('Cloudflare API Shield / Web Assets Endpoint Optimization Agent')
-  .version('0.2.0');
+  .version('0.3.0');
 
 // --------------------------------------------------------------------- propose
 
@@ -609,12 +666,12 @@ program
     if (discarded > 0) {
       console.log(`Discarded records:    ${discarded} (malformed, missing host/method/path)`);
     }
-    if (stats.discovery.truncated || stats.managed.truncated) {
+    if (stats.discovery.truncated || stats.managed.truncated || stats.schemas?.truncated) {
       console.log('Truncated:            YES — the zone exceeds the fetch cap, results are partial');
     }
   });
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   try {
     await program.parseAsync();
   } catch (error) {
@@ -626,4 +683,12 @@ async function main(): Promise<void> {
   }
 }
 
-void main();
+// Only auto-run when this file is the process entrypoint (`node dist/cli.js`,
+// or the `api-shield-optimizer` bin). Importing it from a test — or from any
+// other module — must not have the side effect of parsing `process.argv` and
+// potentially calling `process.exit`. `require.main === module` works because
+// this file compiles to CommonJS (no `"type": "module"` in package.json), the
+// same convention Node's own docs use for a dual library/executable package.
+if (require.main === module) {
+  void main();
+}

@@ -83,7 +83,12 @@ export function parseBoundedInt(
   opts: { min: number; max: number },
 ): number | undefined {
   if (raw === undefined || raw === null || raw === '') return undefined;
-  const parsed = typeof raw === 'number' ? raw : Number.parseInt(raw, 10);
+  // `Number(...)`, not `Number.parseInt(...)`: `parseInt` stops at the first
+  // non-digit character rather than rejecting the rest, so `'1.5'` silently
+  // became `1` and `'5abc'` silently became `5` instead of failing loudly —
+  // the same input-validation gap `scoring-config.ts` explicitly guards
+  // against ("fail loudly instead of clamping").
+  const parsed = typeof raw === 'number' ? raw : Number(raw);
   if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
     throw new ValidationError(`${label} must be an integer`);
   }

@@ -194,6 +194,25 @@ describe('normalizeHost', () => {
     expect(r.canCollapse).toBe(true);
     expect(r.pattern).toBe('{hostVar1}.api.shop.co.uk');
   });
+
+  // Regression: `com.co` (and any other `<generic>.<cc>` ccTLD suffix not on
+  // the explicit list) must still protect its two labels. Two unrelated
+  // organisations under the same suffix must never collapse into one pattern.
+  it.each([
+    ['com.co', 'api.acme.com.co', 'api.evilcorp.com.co'],
+    ['com.vn', 'api.acme.com.vn', 'api.evilcorp.com.vn'],
+    ['com.ph', 'api.acme.com.ph', 'api.evilcorp.com.ph'],
+  ])('refuses to variabilise the apex label under the unlisted suffix %s', (_suffix, a, b) => {
+    const r = normalizeHost([a, b]);
+    expect(r.canCollapse).toBe(false);
+    expect(r.pattern).not.toContain('hostVar');
+  });
+
+  it('still collapses a deeper subdomain above an unlisted generic ccTLD suffix', () => {
+    const r = normalizeHost(['us.api.acme.com.co', 'de.api.acme.com.co']);
+    expect(r.canCollapse).toBe(true);
+    expect(r.pattern).toBe('{hostVar1}.api.acme.com.co');
+  });
 });
 
 describe('groupEndpoints', () => {
@@ -377,6 +396,30 @@ describe('classifyGroup — false positives that used to occur', () => {
   });
 });
 
+describe('classifyGroup — decision ladder rule 7 (ignore via combined threshold)', () => {
+  // Regression: every other `ignore` case in this file reaches it via rule 2
+  // (`apiScore < apiFloor`), which is a hard short-circuit before `combined`
+  // is even consulted. Rule 7 — `ignore` because `combined <= ignoreThreshold`
+  // while `apiScore` has already cleared both `apiFloor` and the evidence gate
+  // — was reachable but had no test exercising it at all.
+  it('ignores an API-shaped endpoint whose combined score is still too low to save', () => {
+    const c = classifyGroup(
+      makeGroup({
+        normalizedPathPattern: '/rest/foo',
+        members: [makeEp({ path: '/rest/foo', hits: 0, host: 'example.com' })],
+      }),
+    );
+
+    // Confirms this really is exercising rule 7, not rule 2: the api score
+    // must clear the floor and the evidence gate must be satisfied.
+    expect(c.score.api).toBeGreaterThanOrEqual(0.4);
+    expect(c.flags).not.toContain('no-api-evidence');
+    expect(c.score.combined).toBeLessThanOrEqual(0.38);
+    expect(c.action).toBe('ignore');
+    expect(c.reasoning[0]).toMatch(/is at or below the 0\.38 ignore threshold/);
+  });
+});
+
 describe('classifyGroup — signal handling', () => {
   it('treats path variables as evidence FOR an API', () => {
     const c = classifyGroup(makeGroup({ normalizedPathPattern: '/things/{var1}' }));
@@ -545,6 +588,10 @@ describe('classifyGroup — Cloudflare managed labels', () => {
     const group = withLabels('/users/login', 'POST', ['cf-web-page', 'cf-log-in']);
     expect(group.recommendedAction).toBe('ignore');
     expect(group.score.api).toBeLessThan(0.4);
+    // Pins the exact api score the README's worked example quotes. Left as a
+    // range above, this drifted to 0.24 in the docs across a weight change with
+    // no test noticing; anchor the number so the example cannot go stale again.
+    expect(group.score.api).toBeCloseTo(0.12, 2);
   });
 
   it('still saves an API login endpoint carrying cf-api-endpoint', () => {
@@ -853,6 +900,50 @@ describe('sensitive endpoints below the api floor', () => {
     const after = applySiblingPropagation(groups);
     expect(after[0].recommendedAction).toBe('manual_review');
   });
+
+  // Regression: a confident parent can lift the child's api score across
+  // `apiFloor`, moving the decision from rule 1 (`sensitive-not-api-shaped`) to
+  // rule 8 (`borderline-score`) while the action stays `manual_review` both
+  // times. The flag and reasoning must move with it — an operator reading the
+  // report must never see the pre-boost floor number attached to a group that
+  // has since cleared the floor.
+  it('replaces the stale rule-1 flag and reasoning after a sibling boost lifts the score past apiFloor', () => {
+    const child = classify(
+      makeGroup({
+        groupId: 'g-child',
+        normalizedPathPattern: '/checkout/session/abc',
+        normalizedHostPattern: 'shop.example.com',
+        members: [makeEp({ host: 'shop.example.com', method: 'POST', path: '/checkout/session/abc' })],
+      }),
+    );
+    expect(child.score.api).toBeLessThan(0.4);
+    expect(child.flags).toContain('sensitive-not-api-shaped');
+
+    const parent = classify(
+      makeGroup({
+        groupId: 'g-parent',
+        normalizedPathPattern: '/checkout/session',
+        normalizedHostPattern: 'shop.example.com',
+        method: 'POST',
+        members: [
+          makeEp({ path: '/checkout/session', method: 'POST', host: 'shop.example.com', inSchema: true }),
+        ],
+      }),
+    );
+    expect(parent.score.api).toBeGreaterThanOrEqual(0.7);
+
+    const [, promoted] = applySiblingPropagation([parent, child]);
+
+    // The boost must actually have crossed the floor, or this test is not
+    // exercising the rule-1-to-rule-8 transition it claims to.
+    expect(promoted.score.api).toBeGreaterThanOrEqual(0.4);
+    expect(promoted.recommendedAction).toBe('manual_review');
+
+    expect(promoted.flags).not.toContain('sensitive-not-api-shaped');
+    expect(promoted.flags).toContain('borderline-score');
+    expect(promoted.reasoning[0]).not.toMatch(/below the 0\.4 floor/);
+    expect(promoted.reasoning[0]).toMatch(/falls between the ignore and save thresholds/);
+  });
 });
 
 describe('sibling-based variable inference', () => {
@@ -1036,6 +1127,24 @@ describe('prefixed identifier formats', () => {
   ])('keeps %s literal', (segment) => {
     expect(isVariableSegment(segment)).toBe(false);
   });
+
+  // Regression: CUIDs matched unconditionally, unlike every other long-id
+  // pattern in this module, so a 25+ char `c`-initial English word — which the
+  // entropy gate exists precisely to keep literal — was flagged as a variable
+  // anyway.
+  it.each(['customerrelationshipmanagement', 'californiaresidentprivacyrights', 'contentmanagementsystemsettings'])(
+    'keeps the long c-initial word %s literal despite matching the CUID shape',
+    (segment) => {
+      expect(isVariableSegment(segment)).toBe(false);
+    },
+  );
+
+  it.each(['cjld2cyuq0000t3rmniod1foy', 'ckq1qg1qk0000abcd1234efgh'])(
+    'still treats a real CUID %s as an identifier',
+    (segment) => {
+      expect(isVariableSegment(segment)).toBe(true);
+    },
+  );
 });
 
 describe('traffic rate signals', () => {
@@ -1390,6 +1499,99 @@ describe('budget and ranking', () => {
     expect(truncated.budget!.proposedSaves).toBe(full.budget!.proposedSaves);
     expect(truncated.budget!.remaining).toBe(full.budget!.remaining);
     expect(truncated.budget!.notes.join(' ')).toMatch(/omitted from this report/);
+  });
+
+  // Regression: nobody had verified `overBudget: true` or its note text — the
+  // report an operator actually reads when a zone has more save-worthy
+  // proposals than available operation slots.
+  it('reports overBudget when proposed saves exceed the configured limit', () => {
+    const endpoints = [saveable('GET'), saveable('POST'), saveable('PUT'), saveable('DELETE')];
+    const bundle = agent.analyze(endpoints, {
+      connectorConfig: { zoneId: 'a'.repeat(32) },
+      operationBudget: 2,
+    });
+
+    expect(bundle.budget!.proposedSaves).toBe(4);
+    expect(bundle.budget!.overBudget).toBe(true);
+    expect(bundle.budget!.remaining).toBe(-2);
+    expect(bundle.budget!.notes.join(' ')).toMatch(
+      /Proposals exceed the operation budget by 2\. Proposals are ranked by value, so the first 2 saves are the highest priority\./,
+    );
+  });
+
+  it('reports remaining slots and no overBudget note when under the limit', () => {
+    const endpoints = [saveable('GET'), saveable('POST')];
+    const bundle = agent.analyze(endpoints, {
+      connectorConfig: { zoneId: 'a'.repeat(32) },
+      operationBudget: 10,
+    });
+
+    expect(bundle.budget!.overBudget).toBe(false);
+    expect(bundle.budget!.remaining).toBe(8);
+    expect(bundle.budget!.notes.join(' ')).toMatch(/8 operation slot\(s\) remain/);
+  });
+
+  // `alreadySaved` counts against the same limit as new proposals — a zone
+  // that is already at capacity must report overBudget even with zero new
+  // saves proposed. Uses a zombie (recommendedAction `manual_review`, not
+  // `save`) so `alreadySaved` and `proposedSaves` are cleanly separate; an
+  // already-saved endpoint that *also* re-qualifies for `save` is counted in
+  // both (see the note below `buildBudget` in agent.ts), which would make this
+  // assertion depend on that overlap rather than on `alreadySaved` alone.
+  it('counts already-saved operations against the same limit', () => {
+    const zombie = makeEp({
+      host: 'api.example.com',
+      method: 'GET',
+      path: '/legacy/report',
+      id: 'saved-1',
+      hits: 0,
+      status: 'saved',
+      labels: ['cf-api-endpoint', 'cf-risk-zombie'],
+    });
+    const bundle = agent.analyze([zombie], {
+      connectorConfig: { zoneId: 'a'.repeat(32) },
+      operationBudget: 1,
+    });
+
+    expect(bundle.proposals[0].action).toBe('manual_review');
+    expect(bundle.budget!.alreadySaved).toBe(1);
+    expect(bundle.budget!.proposedSaves).toBe(0);
+    expect(bundle.budget!.remaining).toBe(0);
+    expect(bundle.budget!.overBudget).toBe(false);
+  });
+
+  // Discovered while adding budget coverage, not previously documented:
+  // `proposedSaves` counts every group classified `save` regardless of
+  // whether it is already saved, so a group that is both `alreadySaved` and
+  // still recommended `save` is subtracted from the limit twice — once via
+  // `alreadySaved`, once via `proposedSaves` — even though it occupies only
+  // one real slot. A zone sitting exactly at capacity with every saved
+  // operation still correctly scoring `save` would report `overBudget: true`
+  // when it is not. Documented here as a known quirk rather than silently
+  // changed, since the fix changes what the budget numbers mean and this
+  // codebase treats that as a deliberate, reviewed decision (see AGENTS.md's
+  // other budget caveats under "Open questions and future work").
+  it('double-counts a still-qualifying save against an already-saved slot (known quirk)', () => {
+    const alreadySavedAndStillQualifies = makeEp({
+      host: 'api.example.com',
+      method: 'GET',
+      path: '/api/v1/payments',
+      id: 'saved-1',
+      status: 'saved',
+      labels: ['cf-api-endpoint'],
+    });
+    const bundle = agent.analyze([alreadySavedAndStillQualifies], {
+      connectorConfig: { zoneId: 'a'.repeat(32) },
+      operationBudget: 1,
+    });
+
+    expect(bundle.proposals[0].action).toBe('save');
+    expect(bundle.budget!.alreadySaved).toBe(1);
+    expect(bundle.budget!.proposedSaves).toBe(1);
+    // Intuitively this operation occupies exactly one slot at a limit of one,
+    // so `remaining` should be 0 and `overBudget` false. It is not, today.
+    expect(bundle.budget!.remaining).toBe(-1);
+    expect(bundle.budget!.overBudget).toBe(true);
   });
 
   // Regression: the traffic term spanned more than the action term, so a busy
@@ -1803,6 +2005,20 @@ describe('percentile-relative traffic thresholds', () => {
 
   it('rejects a percentile outside the unit interval', () => {
     expect(() => validateScoringOverrides({ highTrafficPercentile: 12 })).toThrow(/highTrafficPercentile/);
+  });
+
+  // Regression coverage: `apiWeight`/`sensitivityWeight` are each validated to
+  // lie in [0, 1] independently, but nothing previously checked they sum to 1.
+  // `combined = apiWeight * api + sensitivityWeight * sensitivity` is
+  // calibrated against `saveThreshold`/`ignoreThreshold` assuming the weights
+  // sum to 1; an override that changes only one silently recalibrates what
+  // "save" and "ignore" mean.
+  it('rejects weights that do not sum to 1', () => {
+    expect(() => validateScoringOverrides({ apiWeight: 0.9 })).toThrow(/apiWeight.*sensitivityWeight.*must sum to 1/);
+  });
+
+  it('accepts weights that do sum to 1', () => {
+    expect(() => validateScoringOverrides({ apiWeight: 0.7, sensitivityWeight: 0.3 })).not.toThrow();
   });
 });
 

@@ -89,6 +89,31 @@ describe('identifier validation', () => {
       new CloudflareApiConnector().fetchEndpoints(baseConfig({ state: 'review,../../evil' })),
     ).rejects.toThrow(ValidationError);
   });
+
+  // Regression: the connector checked for a missing token before validating
+  // zoneId, so a malformed zoneId with no token configured was reported as a
+  // missing-token error rather than the actual, more specific problem.
+  it('reports a malformed zoneId even when no token is configured', async () => {
+    mockApi(() => emptyList());
+    await expect(
+      new CloudflareApiConnector().fetchEndpoints(
+        baseConfig({ zoneId: '../../accounts', apiToken: undefined as unknown as string }),
+      ),
+    ).rejects.toThrow(ValidationError);
+  });
+
+  // The other half of the ordering guarantee: a *valid* zoneId with no token
+  // must still be reported as a missing token, not silently accepted or
+  // misreported as a zoneId problem. Without this, the reordering fix above
+  // could regress by, say, always throwing the zoneId error regardless of
+  // which check actually failed.
+  it('reports a missing token when the zoneId is valid', async () => {
+    const fetchMock = mockApi(() => emptyList());
+    await expect(
+      new CloudflareApiConnector().fetchEndpoints(baseConfig({ apiToken: undefined as unknown as string })),
+    ).rejects.toThrow(/apiToken required/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('CloudflareApiConnector pagination and mapping', () => {
@@ -182,6 +207,25 @@ describe('CloudflareApiConnector pagination and mapping', () => {
     expect(endpoints[0].hits).toBe(42);
   });
 
+  it('counts saved operations from the managed operations endpoint alone', async () => {
+    mockApi((url) => {
+      if (url.pathname.endsWith('/api_gateway/operations')) {
+        return jsonResponse({
+          success: true,
+          result_info: { page: 1, per_page: 100, total_pages: 1 },
+          result: [
+            { operation_id: 'm-1', host: 'api.example.com', method: 'GET', endpoint: '/a' },
+            { operation_id: 'm-2', host: 'api.example.com', method: 'POST', endpoint: '/b' },
+          ],
+        });
+      }
+      return emptyList();
+    });
+
+    const count = await new CloudflareApiConnector().countSavedOperations(baseConfig());
+    expect(count).toBe(2);
+  });
+
   it('marks operations covered by an uploaded schema', async () => {
     mockApi((url) => {
       if (url.pathname.endsWith('/discovery/operations')) {
@@ -235,6 +279,30 @@ describe('CloudflareApiConnector pagination and mapping', () => {
     expect(endpoints[0].inSchema).toBeUndefined();
   });
 
+  // Regression coverage: a 403/404 from the schema endpoint is suppressed
+  // inside `fetchPaginated` itself and never reaches `fetchSchemaData`'s own
+  // try/catch (the test above exercises exactly that path). A genuinely
+  // thrown error — a 500, exhausted retries, a network failure — takes a
+  // different route and had never been exercised at all.
+  it('treats a genuine schema-fetch error (not a suppressed 403/404) as non-fatal too', async () => {
+    mockApi((url) => {
+      if (url.pathname.endsWith('/discovery/operations')) {
+        return jsonResponse({
+          success: true,
+          result_info: { page: 1, per_page: 100, total_pages: 1 },
+          result: [{ id: 'd-1', host: 'api.example.com', method: 'GET', endpoint: '/a', state: 'review' }],
+        });
+      }
+      if (url.pathname.endsWith('/api_gateway/operations')) return emptyList();
+      if (url.pathname.endsWith('/user_schemas')) return jsonResponse({ success: false }, 500);
+      throw new Error(`unexpected URL ${url.toString()}`);
+    });
+
+    const endpoints = await new CloudflareApiConnector().fetchEndpoints(baseConfig({ useSchemas: true }));
+    expect(endpoints).toHaveLength(1);
+    expect(endpoints[0].inSchema).toBeUndefined();
+  }, 15_000);
+
   it('retries transient 5xx responses', async () => {
     let discoveryAttempts = 0;
     mockApi((url) => {
@@ -264,6 +332,65 @@ describe('CloudflareApiConnector pagination and mapping', () => {
 
     await expect(new CloudflareApiConnector().fetchEndpoints(baseConfig())).rejects.toThrow(/400/);
     expect(attempts).toBe(1);
+  });
+
+  // Regression: the existing 5xx-retry test above only ever exercises the
+  // HTTP-response branch of the retry loop (a response with a bad status
+  // code). `fetch` itself throwing — a real network failure, DNS error, or
+  // the `AbortError` from `AbortSignal.timeout` — takes a different code path
+  // (`catch (error)` rather than checking `response.status`) and had never
+  // been exercised at all.
+  it('retries a network-level failure, not just a bad HTTP response', async () => {
+    let discoveryAttempts = 0;
+    mockApi((url) => {
+      if (url.pathname.endsWith('/discovery/operations')) {
+        discoveryAttempts += 1;
+        if (discoveryAttempts < 3) throw new TypeError('fetch failed: network error');
+        return jsonResponse({
+          success: true,
+          result_info: { page: 1, per_page: 100, total_pages: 1 },
+          result: [{ id: 'd-1', host: 'api.example.com', method: 'GET', endpoint: '/a', state: 'review' }],
+        });
+      }
+      return emptyList();
+    });
+
+    const endpoints = await new CloudflareApiConnector().fetchEndpoints(baseConfig());
+    expect(discoveryAttempts).toBe(3);
+    expect(endpoints).toHaveLength(1);
+  });
+
+  // Regression: no test ever exhausted every retry attempt, so the final
+  // `throw lastError ?? new Error(...)` line — what the operator actually
+  // sees when a zone is persistently unreachable — was unverified. `MAX_RETRIES`
+  // is 3, so a permanently-failing endpoint makes exactly 4 attempts (the
+  // initial try plus 3 retries) before giving up.
+  it('exhausts retries and surfaces the last error after repeated 5xx responses', async () => {
+    let attempts = 0;
+    mockApi((url) => {
+      if (url.pathname.endsWith('/discovery/operations')) {
+        attempts += 1;
+        return jsonResponse({ success: false }, 503);
+      }
+      return emptyList();
+    });
+
+    await expect(new CloudflareApiConnector().fetchEndpoints(baseConfig())).rejects.toThrow(/503/);
+    expect(attempts).toBe(4);
+  });
+
+  it('exhausts retries and surfaces the last error after a persistent network failure', async () => {
+    let attempts = 0;
+    mockApi((url) => {
+      if (url.pathname.endsWith('/discovery/operations')) {
+        attempts += 1;
+        throw new TypeError('fetch failed: network error');
+      }
+      return emptyList();
+    });
+
+    await expect(new CloudflareApiConnector().fetchEndpoints(baseConfig())).rejects.toThrow(/network error/);
+    expect(attempts).toBe(4);
   });
 
   it('stops paginating at the hard page ceiling', async () => {
@@ -393,6 +520,45 @@ describe('CloudflareApiConnector pagination and mapping', () => {
     expect(stats.discovery.discarded).toBe(1);
     expect(stats.discovery.operationCount).toBe(1);
   });
+
+  // Regression: schema-operation pagination hit the page cap silently — no
+  // `truncated` flag existed on `EndpointFetchStats.schemas` at all, so a zone
+  // with more schema operations than the fetch cap looked identical to one
+  // with none missing.
+  it('surfaces truncation of a schema operations fetch', async () => {
+    const warnings: string[] = [];
+    mockApi((url) => {
+      if (url.pathname.endsWith('/discovery/operations')) return emptyList();
+      if (url.pathname.endsWith('/api_gateway/operations')) return emptyList();
+      if (url.pathname.endsWith('/user_schemas')) {
+        return jsonResponse({
+          success: true,
+          result_info: { page: 1, per_page: 100, total_pages: 1 },
+          result: [{ schema_id: 'schema-1', name: 'public' }],
+        });
+      }
+      if (url.pathname.endsWith('/user_schemas/schema-1/operations')) {
+        // Always a full page, no total_pages — the same shape that trips the
+        // hard page ceiling for discovery/managed operations.
+        return jsonResponse({
+          success: true,
+          result: Array.from({ length: 100 }, (_, i) => ({
+            host: 'api.example.com',
+            method: 'GET',
+            endpoint: `/schema-op/${i}`,
+          })),
+        });
+      }
+      throw new Error(`unexpected URL ${url.toString()}`);
+    });
+
+    const stats = await new CloudflareApiConnector().fetchEndpointStats(
+      baseConfig({ useSchemas: true, onWarning: (m) => warnings.push(m) }),
+    );
+
+    expect(stats.schemas?.truncated).toBe(true);
+    expect(warnings.join(' ')).toMatch(/schema schema-1 operations.*exceeded the 200-page fetch cap/);
+  }, 30_000);
 
   it('defaults the discovery state filter to review,saved,ignored', async () => {
     let discoveryStates: string[] = [];

@@ -232,7 +232,11 @@ continues Cloudflare's numbering rather than colliding with it.
 **Hosts.** A label becomes `{hostVarN}` only when it is a complete label and the
 registrable domain (eTLD+1) is untouched. So `api.example.com` and
 `api.example.org` never collapse, and neither do `api.acme.com` and
-`api.evilcorp.com`. Variable-depth subdomains are never collapsed.
+`api.evilcorp.com`. The same protection extends to two-label ccTLD suffixes —
+`api.acme.com.co` and `api.evilcorp.com.co` never collapse either, even though
+`com.co` isn't on any hardcoded list; a short final label preceded by a generic
+word (`com`, `co`, `gov`, ...) is recognised as a shared suffix for any country
+code. Variable-depth subdomains are never collapsed.
 
 ---
 
@@ -270,11 +274,11 @@ The fourth rule is what separates a rendered form from an endpoint when no label
 is available. An HTML form is submitted with `POST`, lives on an auth path, and
 serves `GET` and `POST` on the same URL, so none of that evidence distinguishes
 it from an API. An operation is only saved automatically if something actually
-discriminating backs it — an uploaded schema, an `api` label, an `/api` or version
-segment, GraphQL/gRPC, a path variable, observed auth identifiers, an API
-hostname, or a confirmed API parent path. Otherwise it goes to a human rather
-than being dropped, because a missing signal is not proof that an endpoint is a
-page.
+discriminating backs it — an uploaded schema, an `api` label, a BOLA or
+missing-schema risk label, an `/api` or version segment, GraphQL/gRPC, a path
+variable, observed auth identifiers, an API hostname, or a confirmed API parent
+path. Otherwise it goes to a human rather than being dropped, because a missing
+signal is not proof that an endpoint is a page.
 
 **`confidence` is separate from the score.** It measures how much evidence backs
 the decision — traffic volume, member count, feature data, schema membership,
@@ -295,7 +299,8 @@ analysis rather than a guess from the URL, so they outweigh path heuristics.
 | `cf-log-in`, `cf-sign-up`, `cf-password-reset` | credential handling → `sensitivity` |
 | `cf-add-payment`, `cf-purchase`, `cf-add-cart`, `cf-check-value` | payment and commerce flows → `sensitivity` |
 | `cf-risk-sensitive` | WAF matched sensitive data in responses → strong `sensitivity` |
-| `cf-risk-bola-*` | active enumeration or pollution attacks observed |
+| `cf-risk-bola-*` | active enumeration or pollution attacks observed — both axes: the attack is only possible against an API, and it is worth protecting |
+| `cf-risk-missing-schema` | a learned schema exists → `api`, implying a structured API surface |
 | `cf-risk-missing-auth`, `cf-risk-mixed-auth` | successful unauthenticated requests |
 | `cf-risk-zombie` | saved but idle 32 days → routed to review to reclaim the slot |
 | `cf-rss-feed` | machine-readable but rarely worth an operation slot |
@@ -304,7 +309,7 @@ This is what separates an HTML login form from an API login endpoint. Both match
 every `login`/`auth` path keyword, but only one carries `cf-web-page`:
 
 ```
-POST www.acme.com/users/login   cf-web-page, cf-log-in   → ignore  (api 0.24)
+POST www.acme.com/users/login   cf-web-page, cf-log-in   → ignore  (api 0.12)
 POST api.acme.com/v1/sessions   cf-api-endpoint, cf-log-in → save  (api 1.00)
 ```
 

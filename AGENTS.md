@@ -21,8 +21,28 @@ to revisit first.
 - A self-sufficient invocation is never interrupted by config scaffolding.
   `optionsAreSelfSufficient()` in `cli.ts` gates it.
 - `--zone-id` is validated **before** the token is resolved, so a malformed zone
-  id is reported as such rather than as a missing token.
+  id is reported as such rather than as a missing token. This holds at both
+  layers: the CLI's `buildConnectorConfig` and the connector's own
+  `resolveScope`, independently — a caller can reach the connector directly
+  without going through the CLI at all.
 - File errors name the file and the cause; no raw `ENOENT`.
+- `cli.ts` compiles to CommonJS (no `"type": "module"` in `package.json`), and
+  `void main()` at the bottom is guarded by `if (require.main === module)`.
+  Importing the module — from a test, or from anywhere else — must never have
+  the side effect of parsing `process.argv` or calling `process.exit`. Every
+  other function in the file is exported for the same reason: `program` itself
+  is also exported so tests can drive the real Commander wiring via
+  `program.parseAsync(argv, { from: 'user' })` instead of spawning a
+  subprocess. None of this is public API — `index.ts` does not re-export
+  `cli.ts` — it exists purely as a testing seam.
+- A zone picker prompt and a "remember this?" follow-up prompt must share one
+  `readline.Interface`/`LineReader`, not open a separate one each via two
+  `askOnce()` calls. Piped input that delivers both answers before the first
+  interface closes gets its second line queued inside that interface's own
+  `LineReader` and discarded when it closes — the second prompt then waits on
+  a stream that has already ended. `selectZoneInteractively` and
+  `offerToRememberZone` in `cli.ts` share a reader for exactly this reason;
+  don't reintroduce a second `askOnce()` call downstream of an existing one.
 
 ## Known bugs, unfixed
 
@@ -104,7 +124,11 @@ functions directly. There is no file-based input path, by design.
 - Keep logic in pure functions; side effects only in connectors and CLI
 
 ## Project structure
-- `src/validate.ts` — ID/state/integer validation shared by CLI and connectors
+- `src/validate.ts` — ID/state/integer validation shared by CLI and connectors.
+  `parseBoundedInt` uses `Number(...)`, not `Number.parseInt(...)` — `parseInt`
+  stops at the first non-digit rather than rejecting the rest of the string, so
+  `--min-hits 1.5` or `--min-hits 5abc` would silently become `1`/`5` instead of
+  failing loudly.
 - `src/connectors/` — the Cloudflare API connector, plus `createConnector`
 - `src/normalize.ts` — path + host normalization, grouping
 - `src/scoring-config.ts` — all tunable weights, patterns, thresholds, `rulesetVersion`
@@ -170,14 +194,19 @@ signal — the worst failure direction for a security tool.
 
 **Do not trigger rule 1 on sensitivity alone.** It is gated on
 `sensitivityRescueApiFloor` (0.3), because a managed `cf-web-page` label pulls
-`api` to ~0.21 and those pages score *higher* on sensitivity (1.00) than the
-endpoints worth rescuing (0.50). Gating on sensitivity alone floods manual review
-with marketing pages.
+`api` to 0 after clamping (base 0.35, label weight -0.5) and those pages score
+*higher* on sensitivity (1.00) than the endpoints worth rescuing (0.50). Gating
+on sensitivity alone floods manual review with marketing pages.
 
 Rule 3 must stay ahead of rule 5: a zombie is definitionally an API, so
 `apiCertain` would auto-save it, but it is *already* saved and the real question
-is whether to reclaim the slot. Mirror any change to rules 1, 3 and 4 in
-`redecide()`, which re-runs the whole decision after sibling propagation.
+is whether to reclaim the slot. Rules 1, 3–8 live in one `decide()` function in
+`classify.ts`, called by both `classifyGroup` and `applySiblingPropagation` —
+there is no second, hand-mirrored copy of the ladder to keep in sync. A boost
+that changes which rule fires while the resulting `Action` value stays the same
+(rule 1 to rule 8, both `manual_review`) must still replace the reported flag
+and reasoning, not just the action; `applySiblingPropagation` always rebuilds
+both from `decide()`'s output rather than only when the action value differs.
 
 **Rule 4 is what stops a rendered page being saved when no label is present.**
 Most of the api axis does not discriminate: an HTML form is submitted with
@@ -186,14 +215,28 @@ Most of the api axis does not discriminate: an HTML form is submitted with
 `rest-method-set` are all equally true of a page. An unlabelled
 `POST /users/login` therefore reaches api 0.62 / combined 0.74 and clears the
 save threshold on evidence that proves nothing. Rule 4 requires at least one
-signal from `discriminatingApiSignals` — a schema, an api label, an `/api` or
-version segment, GraphQL/gRPC, a path variable, observed auth identifiers, an API
-hostname, or propagated parent evidence.
+signal from `discriminatingApiSignals` — a schema, an api label, a bola/missing-
+schema risk label, an `/api` or version segment, GraphQL/gRPC, a path variable,
+observed auth identifiers, an API hostname, or propagated parent evidence.
 
 It escalates rather than ignoring: absent evidence is not evidence of absence,
 and silently dropping a real API is the worse failure. Do not "fix" a
 `no-api-evidence` case by adding a non-discriminating signal to the list; that
 reopens the false positive.
+
+The reverse mistake is just as real and has happened: adding a new positive-
+weight `api`-axis `labelRules` entry (`cf-risk-missing-schema`,
+`cf-risk-bola-*`) without adding its `label-<name>` id to
+`discriminatingApiSignals` in the same change. The label correctly pushes
+`combined` past `saveThreshold`, but rule 4 still intercepts it and routes it
+to `manual_review`, contradicting the weight you just gave it. When a new
+label rule implies an API surface, add it to both places or it is inert.
+
+`apiWeight` and `sensitivityWeight` must sum to 1 — `validateScoringOverrides`
+enforces this. `saveThreshold`/`ignoreThreshold` are calibrated assuming
+`combined` is a true weighted average; changing one weight without the other
+lets `combined` saturate at the clamp far more easily than those thresholds
+assume, silently recalibrating what "save" and "ignore" mean.
 
 `apiHostPatterns` matches the **host**, not the path — a hostname dedicated to an
 API is one of the few discriminators the discovery API supplies for free. It is
@@ -243,8 +286,14 @@ Edit `src/normalize.ts`:
   every hostname through `canonicalizeHost()`; a plain `toLowerCase()` yields
   `{hostvar1}`. New variables must continue Cloudflare's numbering.
 - Hostname variables must cover a **complete label** and must never touch the
-  registrable domain (eTLD+1). Add new multi-label suffixes to
-  `MULTI_LABEL_SUFFIXES`.
+  registrable domain (eTLD+1). `registrableDomainLabelCount()` protects the
+  common case generically — a short final label preceded by a word in
+  `GENERIC_SECOND_LEVEL_LABELS` (`com.co`, `co.jp`, `gov.uk`, ...) is treated as
+  a shared ccTLD suffix for any country code, not just the ones enumerated.
+  `MULTI_LABEL_SUFFIXES` remains for the cases that pattern cannot infer —
+  platform-owned apexes like `pages.dev` and `github.io`, where the
+  second-to-last label is the platform name rather than a generic word. Add new
+  entries there, not country-code guesses.
 - Variable-depth subdomains are **not** collapsed (safety guard)
 
 ## Reading stdin
@@ -317,9 +366,54 @@ Consequences worth remembering:
 - `src/__tests__/review.test.ts` — interactive loop (drive it with `Readable.from`)
 - `src/__tests__/prompt.test.ts` — line buffering and end-of-input behaviour
 - `src/__tests__/config.test.ts` — config mutation, permission and failure modes
+- `src/__tests__/validate.test.ts` — ID/state/integer validation in isolation
+- `src/__tests__/cli.test.ts` — CLI wiring: option resolution, config scaffolding,
+  every command end to end against a mocked `fetch`
 - Run `npm run lint` before committing
 - When fixing a classification bug, add the offending path as a named regression
   case
+
+### Testing `cli.ts`
+
+`program` is a module-level Commander singleton, and Commander's own option
+values persist across multiple `parseAsync()` calls on the *same* instance —
+parsing `--x hello` once and then parsing again with no `--x` at all still
+reports `hello` the second time. Invisible in production (one process, one
+`parseAsync()` call), but reusing the statically imported `program` across many
+`it()` blocks would silently leak one test's flags into the next and produce
+failures that look unrelated to whatever test ran immediately before. `cli.test.ts`
+gives every integration test a fresh module instance instead:
+
+```ts
+async function freshCli() {
+  vi.resetModules();
+  return import('../cli.js');
+}
+```
+
+Don't "simplify" this back to a single top-level `import { program } from
+'../cli.js'` shared across the `describe('program — ...')` blocks — that is
+exactly the bug this pattern avoids. Pure helpers that don't touch `program`
+(`fail`, `resolveToken`, `buildConnectorConfig`, `parseActionList`, ...) are
+fine to import once at the top of the file as usual.
+
+Other things the CLI tests rely on:
+- `process.exit` is mocked to `throw` (a small `ProcessExitError` sentinel)
+  rather than actually exiting, so `fail()` and Commander's own validation
+  errors (missing required options, etc.) can be asserted on without killing
+  the test worker.
+- `vi.spyOn(process, 'cwd')` works for path resolution (`path.resolve`) but
+  **not** for `fs` calls given a relative path — those resolve against the
+  real OS-level cwd (via `process.chdir()`), which the mock never touches. Any
+  code under test that mixes the two (mkdir an absolute-resolved path, then
+  write to the original relative one) will pass in production, where the real
+  and mocked cwd always agree, and fail under this mock. `writeFileEnsuringDir`
+  resolves once and reuses the same absolute path for both calls for exactly
+  this reason — don't reintroduce the split.
+- Commander's `{ from: 'user' }` parse mode expects argv **without** the
+  conventional `['node', 'script']` prefix — pass `['propose', '--zone-id', ...]`,
+  not `['node', 'cli', 'propose', ...]`, or the first real argument is
+  misread as the command name.
 
 ### Assert the shape of the output, not only the scores
 
@@ -349,6 +443,18 @@ overlapping operations, since the discovery API is the only source of a real
 operation list. Note that scraping a site for paths is not a substitute and is
 ruled out by *The live API is the only data source*: a sitemap yields page paths,
 not API operations, so it would validate against the wrong population.
+
+### Budget double-counts a still-qualifying save against its already-saved slot
+`buildBudget()` in `agent.ts` computes `remaining = limit - alreadySaved -
+proposedSaves`, but `proposedSaves` counts every group classified `save`
+regardless of whether it is already saved. A group that is both `alreadySaved`
+and still recommended `save` is subtracted twice even though it occupies one
+real slot, so a zone sitting exactly at capacity with every saved operation
+still correctly scoring `save` reports `overBudget: true` when it should not.
+Fixing it means deciding what `proposedSaves` should mean (total groups worth
+saving, or only the *new* ones) and that changes a number an operator reads
+directly, so it is left as a known quirk rather than changed unreviewed. See
+the "budget and ranking" tests in `engine.test.ts` for the exact numbers.
 
 ### Percentile thresholds are untuned against a real distribution
 `highTrafficPercentile` (0.9) and `lowTrafficPercentile` (0.25) are guesses. On a

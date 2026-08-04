@@ -57,6 +57,15 @@ interface DiscoveryOperation {
    */
   origin?: string[] | string;
   source?: string;
+  /**
+   * Legacy/optional field. The live discovery API reports traffic only as a
+   * rate (`features.traffic_stats.requests` over `period_seconds`), never as
+   * an absolute total — see "Response metadata is not available" and
+   * "Traffic data" in AGENTS.md — so this is expected to be absent on every
+   * real response and `hits` falls back to `null`. Accepted defensively in
+   * case an older or non-standard response shape supplies it; do not depend
+   * on it being populated.
+   */
   total_requests?: number;
   /** The API returns `last_updated`; `last_seen` is accepted as a legacy form. */
   last_updated?: string;
@@ -107,7 +116,7 @@ export interface EndpointFetchStats {
   discovery: { pagesFetched: number; operationCount: number; discarded: number; truncated: boolean };
   managed: { pagesFetched: number; operationCount: number; discarded: number; truncated: boolean };
   merged: { endpointCount: number };
-  schemas?: { schemaCount: number; operationCount: number };
+  schemas?: { schemaCount: number; operationCount: number; truncated: boolean };
 }
 
 /** Validated credentials and identifiers for one run of requests. */
@@ -336,8 +345,7 @@ export class CloudflareApiConnector implements DataConnector {
     };
 
     if (config.useSchemas !== false) {
-      const schemaInfo = await this.fetchSchemaInfo(scope);
-      if (schemaInfo) stats.schemas = schemaInfo;
+      stats.schemas = await this.fetchSchemaInfo(scope);
     }
 
     return stats;
@@ -350,14 +358,20 @@ export class CloudflareApiConnector implements DataConnector {
    * be validated here: `new URL()` resolves `..` segments, which would let an
    * unvalidated identifier redirect the request to an arbitrary Cloudflare API
    * endpoint using this token.
+   *
+   * The zone ID is validated before the token is checked, so a malformed zone
+   * ID is reported as such rather than as a missing token — matching the CLI's
+   * own resolution order (see `optionsAreSelfSufficient` in `cli.ts`), which a
+   * direct library caller bypassing the CLI must still get right.
    */
   private resolveScope(config: ConnectorConfig): RequestScope {
+    const zoneId = assertCloudflareId(config.zoneId, 'zoneId');
     if (!config.apiToken) {
       throw new Error('apiToken required for API mode');
     }
     return {
       apiToken: config.apiToken,
-      zoneId: assertCloudflareId(config.zoneId, 'zoneId'),
+      zoneId,
       accountId: assertOptionalCloudflareId(config.accountId, 'accountId'),
       states: parseDiscoveryStates(config.state),
       onWarning: config.onWarning,
@@ -477,19 +491,32 @@ export class CloudflareApiConnector implements DataConnector {
   }
 
   /**
-   * Returns the set of operation shapes covered by uploaded API schemas.
-   * Schema membership is the highest-precision "this is a real API" signal
-   * available. Failures are non-fatal: the signal is enrichment, not a
-   * requirement.
+   * Fetches every uploaded schema and the operations it covers. Schema
+   * membership is the highest-precision "this is a real API" signal available.
+   * Failures are non-fatal: the signal is enrichment, not a requirement.
+   *
+   * Shared by `fetchSchemaShapes` and `fetchSchemaInfo` so both report the same
+   * truncation state and neither re-fetches the schema list the other already
+   * fetched.
    */
-  private async fetchSchemaShapes(scope: { apiToken: string; zoneId: string }): Promise<Set<string>> {
+  private async fetchSchemaData(scope: {
+    apiToken: string;
+    zoneId: string;
+    onWarning?: (message: string) => void;
+  }): Promise<{ shapes: Set<string>; schemaCount: number; truncated: boolean }> {
     const shapes = new Set<string>();
+    let schemaCount = 0;
+    let truncated = false;
+
     try {
       const schemas = await this.fetchPaginated<UserSchema>(
         new URL(`${API_BASE}/zones/${scope.zoneId}/api_gateway/user_schemas`),
         scope.apiToken,
         true,
       );
+      warnIfTruncated(schemas, 'schema', scope.onWarning);
+      truncated = truncated || schemas.truncated;
+      schemaCount = schemas.items.length;
 
       for (const schema of schemas.items) {
         if (!schema.schema_id) continue;
@@ -499,33 +526,39 @@ export class CloudflareApiConnector implements DataConnector {
           scope.apiToken,
           true,
         );
+        warnIfTruncated(operations, `schema ${schema.schema_id} operations`, scope.onWarning);
+        truncated = truncated || operations.truncated;
         for (const op of operations.items) {
           shapes.add(shapeKey(normalizeHost(op.host), normalizeMethod(op.method), normalizePath(op.endpoint)));
         }
       }
     } catch {
       // Schema enrichment is optional; absence simply removes a signal.
-      return shapes;
+      return { shapes, schemaCount, truncated };
     }
+    return { shapes, schemaCount, truncated };
+  }
+
+  /** Returns the set of operation shapes covered by uploaded API schemas. */
+  private async fetchSchemaShapes(scope: {
+    apiToken: string;
+    zoneId: string;
+    onWarning?: (message: string) => void;
+  }): Promise<Set<string>> {
+    const { shapes } = await this.fetchSchemaData(scope);
     return shapes;
   }
 
   private async fetchSchemaInfo(scope: {
     apiToken: string;
     zoneId: string;
-  }): Promise<{ schemaCount: number; operationCount: number } | undefined> {
-    try {
-      const schemas = await this.fetchPaginated<UserSchema>(
-        new URL(`${API_BASE}/zones/${scope.zoneId}/api_gateway/user_schemas`),
-        scope.apiToken,
-        true,
-      );
-      if (schemas.items.length === 0) return { schemaCount: 0, operationCount: 0 };
-      const shapes = await this.fetchSchemaShapes(scope);
-      return { schemaCount: schemas.items.length, operationCount: shapes.size };
-    } catch {
-      return undefined;
-    }
+    onWarning?: (message: string) => void;
+  }): Promise<{ schemaCount: number; operationCount: number; truncated: boolean }> {
+    // No try/catch here: `fetchSchemaData` already swallows its own failures
+    // and resolves normally (schema enrichment is optional), so it never
+    // rejects. A wrapping catch here would be unreachable dead code.
+    const { shapes, schemaCount, truncated } = await this.fetchSchemaData(scope);
+    return { schemaCount, operationCount: shapes.size, truncated };
   }
 
   /** Counts operations already saved in the zone, for budget reporting. */

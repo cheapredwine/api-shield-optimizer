@@ -67,6 +67,11 @@ export function canonicalizeHost(host: string): string {
     })
     .join('.');
 }
+// CUIDs are gated behind `isHighCardinalitySegment` (see `isVariableSegment`),
+// the same as KSUID and base64 below. A plain-English word starting with `c`
+// can run 25+ letters (`customerrelationshipmanagement`) and would otherwise
+// match unconditionally — exactly the false-positive class the entropy gate
+// exists to catch.
 const CUID_RE = /^c[a-z0-9]{24,}$/i;
 const KSUID_RE = /^[0-9A-Za-z]{27}$/;
 
@@ -108,24 +113,34 @@ const STATIC_SEGMENT_ALLOWLIST = new Set([
   'settings',
   'users',
   // Action verbs and collection-level sub-resources
+  'add',
   'all',
+  'archive',
   'batch',
   'browse',
   'bulk',
   'callback',
   'cancel',
+  'clone',
   'compare',
   'confirm',
   'count',
+  'create',
   'current',
   'default',
+  'delete',
+  'detail',
+  'details',
   'download',
+  'duplicate',
+  'edit',
   'export',
   'filter',
   'filters',
   'history',
   'import',
   'latest',
+  'list',
   'logout',
   'me',
   'metadata',
@@ -134,7 +149,9 @@ const STATIC_SEGMENT_ALLOWLIST = new Set([
   'purchase',
   'refresh',
   'register',
+  'remove',
   'reset',
+  'restore',
   'revoke',
   'schema',
   'search',
@@ -144,53 +161,73 @@ const STATIC_SEGMENT_ALLOWLIST = new Set([
   'submit',
   'suggest',
   'summary',
+  'update',
   'upload',
   'validate',
   'verify',
+  'view',
 ]);
 
 /**
  * Multi-label public suffixes that must never be collapsed into a variable.
  * Collapsing any label of the registrable domain would merge unrelated
  * organisations (`api.acme.com` + `api.evilcorp.com`) into one pattern.
+ *
+ * This set cannot be exhaustive — the real public suffix list has hundreds of
+ * entries — so it exists only for the handful of suffixes the generic rule in
+ * `registrableDomainLabelCount` below cannot infer: platform subdomains like
+ * `pages.dev` and `github.io`, where the second-to-last label is the platform
+ * name rather than a generic word and every organisation shares the same
+ * apex.
  */
-const MULTI_LABEL_SUFFIXES = new Set([
-  'co.uk',
-  'org.uk',
-  'ac.uk',
-  'gov.uk',
-  'co.jp',
-  'or.jp',
-  'ne.jp',
-  'co.nz',
-  'co.za',
-  'com.au',
-  'net.au',
-  'org.au',
-  'com.br',
-  'com.cn',
-  'com.mx',
-  'com.sg',
-  'com.tr',
-  'co.in',
-  'co.kr',
-  'co.il',
-  'com.hk',
-  'com.tw',
-  'pages.dev',
-  'workers.dev',
-  'github.io',
+const MULTI_LABEL_SUFFIXES = new Set(['pages.dev', 'workers.dev', 'github.io']);
+
+/**
+ * Second-level labels that, paired with a short final label, mark a shared
+ * ccTLD suffix (`com.co`, `co.jp`, `gov.uk`, ...) rather than a registrable
+ * second-level domain. Generic across every country code, so a country
+ * missing from any explicit list still gets the extra label of protection.
+ */
+const GENERIC_SECOND_LEVEL_LABELS = new Set([
+  'com',
+  'net',
+  'org',
+  'co',
+  'gov',
+  'govt',
+  'edu',
+  'ac',
+  'or',
+  'ne',
+  'go',
+  'mil',
+  'biz',
+  'info',
+  'gob',
+  'gouv',
 ]);
 
 /**
  * Number of trailing labels that form the registrable domain (eTLD+1).
- * Uses a bundled multi-label suffix set; unknown suffixes fall back to 2,
- * which is the conservative choice because it protects more labels.
+ *
+ * A short final label preceded by a generic second-level word — `com.co`,
+ * `co.jp`, `gov.uk` — is almost always a shared ccTLD suffix, not a
+ * registrable second-level domain, whatever the country code is. This catches
+ * suffixes no explicit list enumerates (`com.co`, `com.vn`, `com.ph`, ...)
+ * without needing a country-by-country entry for each. `MULTI_LABEL_SUFFIXES`
+ * remains for the cases this pattern cannot infer. Any suffix matching
+ * neither falls back to 2, the conservative choice because it protects more
+ * labels than assuming a single-label TLD would.
  */
 export function registrableDomainLabelCount(labels: string[]): number {
   if (labels.length <= 2) return labels.length;
-  const lastTwo = labels.slice(-2).join('.');
-  if (MULTI_LABEL_SUFFIXES.has(lastTwo)) {
+  const lastTwo = labels.slice(-2);
+  const suffix = lastTwo.join('.');
+  if (MULTI_LABEL_SUFFIXES.has(suffix)) {
+    return Math.min(labels.length, 3);
+  }
+  const [secondLevel, tld] = lastTwo;
+  if (tld.length <= 3 && GENERIC_SECOND_LEVEL_LABELS.has(secondLevel)) {
     return Math.min(labels.length, 3);
   }
   return 2;
@@ -304,11 +341,14 @@ export function isVariableSegment(segment: string): boolean {
   if (UUID_RE.test(segment)) return true;
   if (ULID_RE.test(segment)) return true;
   if (MONGO_OBJECT_ID_RE.test(segment)) return true;
-  if (CUID_RE.test(segment)) return true;
+  if (CUID_RE.test(segment) && isHighCardinalitySegment(segment)) return true;
   if (KSUID_RE.test(segment) && isHighCardinalitySegment(segment)) return true;
   if (DATE_RE.test(segment)) return true;
   if (TIMESTAMP_RE.test(segment)) return true;
-  if (HEX_RE.test(segment)) return true;
+  // Requires a digit, matching `segmentShape`'s `hex` class below — a purely
+  // alphabetic a-f run is far more likely to be a coincidental readable
+  // fragment than an opaque hex id.
+  if (HEX_RE.test(segment) && digitCount(segment) >= 1) return true;
   if (BASE64_RE.test(segment) && isHighCardinalitySegment(segment)) return true;
   return false;
 }
@@ -427,11 +467,16 @@ function emptyScore(): NormalizedGroup['score'] {
 
 /**
  * Groups endpoints by method + normalized path, then splits each bucket into
- * the smallest number of host clusters that can be safely represented by a
- * single hostname pattern.
+ * host clusters that can each be safely represented by a single hostname
+ * pattern.
  *
  * Grouping is deterministic: input is sorted before clustering, so results do
- * not depend on API page ordering.
+ * not depend on API page ordering. Clustering itself is a greedy first-fit
+ * (see `clusterByHost`) and is not guaranteed to find the minimum possible
+ * number of clusters — a pathological label arrangement can produce more,
+ * smaller clusters than an optimal partition would. That is the safe
+ * direction: it only ever splits a group that could have collapsed, never
+ * merges hosts that should stay apart.
  */
 /**
  * Distinct sibling values required before a path position is treated as a
