@@ -1,5 +1,10 @@
 # API Shield Optimizer
 
+> ⚠️ **NOT OFFICIAL CLOUDFLARE.** Not affiliated with or endorsed by Cloudflare, Inc.
+> NO WARRANTIES, EXPRESS OR IMPLIED. Effectively untested demo code — read everything
+> and dry-run before you run. You assume all risk. See [DISCLAIMER.md](./DISCLAIMER.md).
+
+
 A command-line tool that reads Cloudflare API Shield endpoint discovery, groups
 the noise into stable patterns, and proposes which operations to **save** and
 which to **ignore** — with the evidence for each call spelled out.
